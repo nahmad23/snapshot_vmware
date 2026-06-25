@@ -50,6 +50,26 @@
           run the playbook with --ask-vault-pass or --vault-password-file.
         quiet: true
 
+    - name: Verify PyVmomi is installed for the active Python interpreter
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python_interpreter | default(ansible_playbook_python) }}"
+          - "-c"
+          - "import pyVmomi"
+      register: _pyvmomi_check
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if PyVmomi is missing
+      ansible.builtin.fail:
+        msg: >-
+          PyVmomi is not importable by the interpreter
+          '{{ ansible_python_interpreter | default(ansible_playbook_python) }}'.
+          Install it with:
+          {{ ansible_python_interpreter | default(ansible_playbook_python) }}
+          -m pip install --upgrade pyvmomi
+      when: _pyvmomi_check.rc != 0
+
     - name: Validate CSV file exists
       ansible.builtin.stat:
         path: "{{ csv_file }}"
