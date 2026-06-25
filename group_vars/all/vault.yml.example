@@ -1,0 +1,27 @@
+---
+# group_vars/all/vault.yml.example
+#
+# TEMPLATE ONLY — copy this to group_vars/all/vault.yml and ENCRYPT it.
+#
+# 1. Copy:
+#      cp group_vars/all/vault.yml.example group_vars/all/vault.yml
+#
+# 2. Put your real vCenter credentials in the copy.
+#
+# 3. Encrypt it with Ansible Vault:
+#      ansible-vault encrypt group_vars/all/vault.yml
+#
+#    (Or create + encrypt in one step:
+#      ansible-vault create group_vars/all/vault.yml )
+#
+# 4. Run the playbook supplying the vault password:
+#      ansible-playbook -i inventory.ini create_snapshots.yml --ask-vault-pass
+#    or, with a password file:
+#      ansible-playbook -i inventory.ini create_snapshots.yml \
+#        --vault-password-file ~/.vault_pass
+#
+# The real (encrypted) group_vars/all/vault.yml is git-ignored so plaintext
+# secrets are never committed. Commit only the ENCRYPTED file if you choose to.
+
+vault_vcenter_username: "administrator@vsphere.local"
+vault_vcenter_password: "CHANGE_ME"

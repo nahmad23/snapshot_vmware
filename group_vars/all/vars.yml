@@ -1,0 +1,11 @@
+---
+# group_vars/all/vars.yml
+#
+# Non-secret variables, automatically loaded for localhost.
+# These reference the secret values stored (encrypted) in vault.yml.
+# Keeping the indirection here means the playbook references plain names
+# (vcenter_username / vcenter_password) while the actual secrets live only
+# inside the encrypted vault.yml.
+
+vcenter_username: "{{ vault_vcenter_username }}"
+vcenter_password: "{{ vault_vcenter_password }}"

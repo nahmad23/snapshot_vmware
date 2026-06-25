@@ -1,0 +1,83 @@
+---
+# tasks/snapshot_vcenter.yml
+# Called once per vCenter via include_tasks loop in create_snapshots.yml.
+# Expects:
+#   current_vc_host  - vCenter hostname (loop_var)
+#   vcenter_creds    - dict of {hostname: {host, user, password}}
+#   vms_by_vcenter   - dict of {hostname: [vm list]}
+#   snap_name        - snapshot name
+#   snap_desc        - snapshot description
+#   snapshot_results - list accumulating per-vCenter summaries
+
+- name: "Set working vars for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc: "{{ vcenter_creds[current_vc_host] }}"
+    _vms: "{{ vms_by_vcenter[current_vc_host] }}"
+
+- name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
+  ansible.builtin.debug:
+    msg: "No VMs assigned to {{ current_vc_host }} in CSV — skipping."
+  when: _vms | length == 0
+
+- name: "Fire async snapshot tasks for {{ current_vc_host }} ({{ _vms | length }} VMs)"
+  community.vmware.vmware_guest_snapshot:
+    hostname: "{{ _vc.host }}"
+    username: "{{ _vc.user }}"
+    password: "{{ _vc.password }}"
+    validate_certs: false
+    datacenter: "{{ item.datacenter }}"
+    folder: "/{{ item.datacenter }}/vm"
+    name: "{{ item.vm_name }}"
+    state: present
+    snapshot_name: "{{ snap_name }}"
+    description: "{{ snap_desc }}"
+    memory_dump: false
+    quiesce: false
+  loop: "{{ _vms }}"
+  loop_control:
+    label: "{{ item.vm_name }}"
+  async: 600
+  poll: 0
+  ignore_errors: true
+  register: _async_jobs
+  when: _vms | length > 0
+
+- name: "Wait for all snapshot jobs on {{ current_vc_host }}"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ _async_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }}"
+  register: _job_results
+  until: _job_results.finished
+  retries: 60
+  delay: 10
+  ignore_errors: true
+  when: _vms | length > 0
+
+- name: "Append {{ current_vc_host }} results to snapshot_results"
+  ansible.builtin.set_fact:
+    snapshot_results: >-
+      {{ snapshot_results + [{
+           'vcenter':   current_vc_host,
+           'total':     _vms | length,
+           'succeeded': _job_results.results
+                        | default([])
+                        | selectattr('failed', 'equalto', false)
+                        | map(attribute='item.item.vm_name')
+                        | list,
+           'failed':    _job_results.results
+                        | default([])
+                        | selectattr('failed', 'equalto', true)
+                        | map(attribute='item.item.vm_name')
+                        | list
+         }] }}
+
+- name: "{{ current_vc_host }} — snapshot summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== {{ current_vc_host }} — snapshot: '{{ snap_name }}' ==="
+      - "  Total VMs : {{ _vms | length }}"
+      - "  Succeeded : {{ snapshot_results[-1].succeeded | length }}"
+      - "  Failed    : {{ snapshot_results[-1].failed | length }}"
+      - "  Failed VMs: {{ snapshot_results[-1].failed if snapshot_results[-1].failed else 'none' }}"

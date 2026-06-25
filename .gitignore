@@ -1,0 +1,4 @@
+# Never commit decrypted Vault secrets
+group_vars/all/vault.yml
+.vault_pass
+*.retry

@@ -1,0 +1,194 @@
+---
+# Playbook: create_snapshots.yml
+#
+# Fully non-interactive snapshot playbook.
+#   * vCenter username & password are read from Ansible Vault
+#     (group_vars/all/vault.yml -> vault_vcenter_username / vault_vcenter_password).
+#   * The snapshot name is auto-generated as:  yyyymmdd-security-update
+#   * vCenter hostnames are taken directly from the CSV `vcenter` column —
+#     no URL prompts and no manual input of any kind during execution.
+#
+# Run it with:
+#   ansible-playbook -i inventory.ini create_snapshots.yml --ask-vault-pass
+#   ansible-playbook -i inventory.ini create_snapshots.yml --vault-password-file ~/.vault_pass
+#
+# CSV columns required:
+#   vm_name    - VM display name in vCenter (must match exactly)
+#   datacenter - Datacenter the VM belongs to
+#   vcenter    - Hostname or IP of the vCenter that manages this VM
+
+- name: Load CSV inventory and gather credentials
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # vCenter credentials resolved from Vault-backed group_vars.
+    # See group_vars/all/vars.yml and group_vars/all/vault.yml.
+    vcenter_username: "{{ vault_vcenter_username }}"
+    vcenter_password: "{{ vault_vcenter_password }}"
+
+    # Snapshot name auto-generated in the format: yyyymmdd-security-update
+    # e.g. 20260625-security-update
+    snapshot_name: "{{ now(utc=true, fmt='%Y%m%d') }}-security-update"
+    snapshot_description: "Automated snapshot before security update"
+
+    # CSV inventory path. Override at runtime with:
+    #   -e "csv_file=/path/to/my_inventory.csv"
+    csv_file: "vm_inventory.csv"
+
+  tasks:
+    - name: Ensure vCenter credentials are available from Vault
+      ansible.builtin.assert:
+        that:
+          - vcenter_username is defined
+          - vcenter_username | length > 0
+          - vcenter_password is defined
+          - vcenter_password | length > 0
+        fail_msg: >-
+          vCenter credentials were not found. Define vault_vcenter_username and
+          vault_vcenter_password in group_vars/all/vault.yml (Ansible Vault) and
+          run the playbook with --ask-vault-pass or --vault-password-file.
+        quiet: true
+
+    - name: Validate CSV file exists
+      ansible.builtin.stat:
+        path: "{{ csv_file }}"
+      register: csv_stat
+
+    - name: Abort if CSV file not found
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' not found. Please check the path."
+      when: not csv_stat.stat.exists
+
+    - name: Load VM inventory from CSV
+      community.general.read_csv:
+        path: "{{ csv_file }}"
+      register: vm_csv
+
+    - name: Validate CSV has required columns
+      ansible.builtin.fail:
+        msg: >
+          CSV is missing required columns. Required: vm_name, datacenter, vcenter.
+          Found: {{ vm_csv.list[0].keys() | list }}
+      when: >
+        vm_csv.list | length == 0 or
+        'vm_name' not in vm_csv.list[0] or
+        'datacenter' not in vm_csv.list[0] or
+        'vcenter' not in vm_csv.list[0]
+
+    - name: Extract unique vCenter hostnames from CSV
+      ansible.builtin.set_fact:
+        vcenter_hosts: "{{ vm_csv.list | map(attribute='vcenter') | unique | list | sort }}"
+
+    - name: Show vCenters detected in CSV
+      ansible.builtin.debug:
+        msg:
+          - "Detected {{ vcenter_hosts | length }} vCenter(s) in CSV:"
+          - "{{ vcenter_hosts }}"
+
+    - name: Build vCenter credentials map (shared Vault credentials for all vCenters)
+      ansible.builtin.set_fact:
+        vcenter_creds: >-
+          {{ vcenter_creds | default({}) | combine({
+               item: {
+                 'host': item,
+                 'user': vcenter_username,
+                 'password': vcenter_password
+               }
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+    - name: Build VMs-by-vCenter map
+      ansible.builtin.set_fact:
+        vms_by_vcenter: >-
+          {{ vms_by_vcenter | default({}) | combine({
+               item: vm_csv.list | selectattr('vcenter', 'equalto', item) | list
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+
+    - name: Store snapshot metadata and initialise results list
+      ansible.builtin.set_fact:
+        snap_name: "{{ snapshot_name }}"
+        snap_desc: "{{ snapshot_description }}"
+        snapshot_results: []
+        cacheable: false
+
+    - name: Inventory summary
+      ansible.builtin.debug:
+        msg: >-
+          CSV loaded: {{ vm_csv.list | length }} total VMs across
+          {{ vcenter_hosts | length }} vCenter(s).
+          Snapshot name: {{ snap_name }}.
+          {% for vc in vcenter_hosts %}
+          {{ vc }}: {{ vms_by_vcenter[vc] | length }} VMs
+          {% endfor %}
+
+# ---------------------------------------------------------------------------
+# Create snapshots — one include_tasks per vCenter (dynamic, any count)
+# ---------------------------------------------------------------------------
+- name: Create snapshots on all vCenters
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Process snapshots for each vCenter
+      ansible.builtin.include_tasks: tasks/snapshot_vcenter.yml
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        loop_var: current_vc_host
+        label: "{{ current_vc_host }}"
+
+# ---------------------------------------------------------------------------
+# Combined final report
+# ---------------------------------------------------------------------------
+- name: Final combined report
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Per-vCenter snapshot results
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ item.vcenter }} ==="
+          - "  Total VMs : {{ item.total }}"
+          - "  Succeeded : {{ item.succeeded | length }}"
+          - "  Failed    : {{ item.failed | length }}"
+          - "  Failed VMs: {{ item.failed if item.failed else 'none' }}"
+      loop: "{{ snapshot_results }}"
+      loop_control:
+        label: "{{ item.vcenter }}"
+
+    - name: Overall snapshot report
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " SNAPSHOT RUN COMPLETE"
+          - "========================================="
+          - " Snapshot name : {{ snap_name }}"
+          - " CSV inventory : {{ vm_csv.list | length }} VMs total"
+          - " vCenters      : {{ vcenter_hosts | length }}"
+          - "-----------------------------------------"
+          - " Total succeeded : {{ snapshot_results | map(attribute='succeeded') | map('length') | sum }}"
+          - " Total failed    : {{ snapshot_results | map(attribute='failed') | map('length') | sum }}"
+          - "========================================="
+
+    - name: List all failed VMs across all vCenters
+      ansible.builtin.debug:
+        msg: "FAILED on {{ item.0.vcenter }}: {{ item.1 }}"
+      loop: >-
+        {{ snapshot_results
+           | selectattr('failed', 'ne', [])
+           | subelements('failed') }}
+      loop_control:
+        label: "{{ item.1 }}"
+      when: snapshot_results | map(attribute='failed') | map('length') | sum > 0
+
+    - name: Fail playbook if any snapshot failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ snapshot_results | map(attribute='failed') | map('length') | sum }}
+          VM(s) failed to snapshot. See list above.
+      when: snapshot_results | map(attribute='failed') | map('length') | sum > 0
