@@ -1,8 +1,14 @@
-# Multi-vCenter VM Snapshot Playbook (non-interactive, Vault-backed)
+# Multi-vCenter VM Snapshot Playbooks (non-interactive, Vault-backed)
 
-Creates snapshots for VMs listed in a CSV inventory across **any number** of
-vCenter servers. The run is **fully non-interactive** — there are no prompts
-during execution:
+Two playbooks that manage the full snapshot lifecycle for VMs listed in a CSV
+inventory, across **any number** of vCenter servers:
+
+| Playbook | Purpose |
+|---|---|
+| `create_snapshots.yml` | Creates a `yyyymmdd-security-update` snapshot on every VM in the CSV |
+| `delete_snapshots.yml` | **Retention** — deletes those snapshots once they are older than 10 days |
+
+Both runs are **fully non-interactive** — there are no prompts during execution:
 
 * vCenter **username and password** are read from **Ansible Vault**.
 * The **snapshot name is auto-generated** in the format `yyyymmdd-security-update`
@@ -13,9 +19,11 @@ during execution:
 
 ```
 snapshot_vmware/
-├── create_snapshots.yml          # main playbook (no prompts)
+├── create_snapshots.yml          # create snapshots (no prompts)
+├── delete_snapshots.yml          # delete snapshots older than N days (no prompts)
 ├── tasks/
-│   └── snapshot_vcenter.yml       # per-vCenter snapshot logic
+│   ├── snapshot_vcenter.yml         # per-vCenter snapshot creation logic
+│   └── delete_snapshots_vcenter.yml # per-vCenter retention/deletion logic
 ├── group_vars/
 │   └── all/
 │       ├── vars.yml               # maps vcenter_username/password -> vault vars
@@ -133,3 +141,89 @@ ansible-playbook -i inventory.ini create_snapshots.yml \
 * **Per-VM timeout** (`async: 600` in `tasks/snapshot_vcenter.yml`): 10 minutes per VM.
 * **Snapshot options:** `quiesce: true` freezes the guest filesystem (needs VMware Tools);
   `memory_dump: true` includes RAM state (slower, larger).
+
+---
+
+# Snapshot retention — `delete_snapshots.yml`
+
+Deletes snapshots **older than 10 days** from every VM in the same CSV. It uses
+the same Vault credentials, the same CSV and the same multi-vCenter handling as
+`create_snapshots.yml`, so there is nothing extra to configure.
+
+```bash
+# See what WOULD be deleted — deletes nothing
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
+  -e "delete_dry_run=true"
+
+# Actually delete
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass
+
+# Unattended (cron)
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass
+```
+
+> Run it once with `-e "delete_dry_run=true"` before the first real run.
+
+## What it does
+
+1. Runs the same preflight checks as the create playbook (Vault credentials, PyVmomi, CSV).
+2. Computes a cutoff timestamp of `now (UTC) − snapshot_retention_days`.
+3. Queries every VM in the CSV for its existing snapshots (asynchronously, per vCenter).
+4. Selects snapshots that are **both** older than the cutoff **and** whose name
+   matches `snapshot_name_pattern`.
+5. Deletes them asynchronously — one failure never stops the rest.
+6. Prints per-vCenter and combined found/deleted/failed counts, and exits
+   non-zero if any deletion failed.
+
+## Safety
+
+The name filter is the important part. By default only snapshots whose name ends
+in `-security-update` — i.e. the ones `create_snapshots.yml` created — are ever
+eligible for deletion. A manual snapshot called `before-db-migration` is left
+alone no matter how old it is.
+
+Child snapshots are also protected: `snapshot_remove_children` is `false`, so
+deleting an expired parent consolidates its delta into the disk (standard VMware
+behaviour) rather than destroying newer snapshots taken on top of it.
+
+## Options
+
+All of these are overridable with `-e` at runtime:
+
+| Variable | Default | Description |
+|---|---|---|
+| `snapshot_retention_days` | `10` | Delete snapshots older than this many days |
+| `snapshot_name_pattern` | `-security-update$` | Regex a snapshot name must match to be eligible. Set to `""` to consider **every** snapshot (dangerous) |
+| `delete_dry_run` | `false` | Report expired snapshots without deleting anything |
+| `snapshot_remove_children` | `false` | Also delete child snapshots of an expired snapshot |
+| `fail_on_unreadable` | `false` | Exit non-zero if a CSV VM could not be queried (renamed/decommissioned). Off by default so a stale CSV row does not break a cron run — such VMs are always listed in the report |
+| `csv_file` | `vm_inventory.csv` | Path to the VM inventory CSV |
+
+```bash
+# Keep snapshots for 14 days instead of 10
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
+  -e "snapshot_retention_days=14"
+```
+
+## Scheduling both playbooks
+
+Snapshots created on day 0 are removed on day 10 by the retention run, so a
+daily cron entry for each is all that is needed:
+
+```cron
+# Create the security-update snapshots at 01:00
+0 1 * * * cd /opt/snapshot_vmware && ansible-playbook -i inventory.ini create_snapshots.yml --vault-password-file ~/.vault_pass >> /var/log/vm_snapshots.log 2>&1
+
+# Purge snapshots older than 10 days at 03:00
+0 3 * * * cd /opt/snapshot_vmware && ansible-playbook -i inventory.ini delete_snapshots.yml --vault-password-file ~/.vault_pass >> /var/log/vm_snapshot_purge.log 2>&1
+```
+
+## Retention tuning
+
+* **Info timeout** (`async: 300`): 5 minutes per VM to read its snapshot list.
+* **Delete timeout** (`async: 1800`, `retries: 120`, `delay: 15`): up to 30 minutes
+  per snapshot removal. Consolidating a large delta disk can be slow — raise these
+  if you snapshot very busy VMs.
+* Age comparison is done in **UTC** against the `creation_time` vCenter reports,
+  so controller timezone does not affect which snapshots expire.

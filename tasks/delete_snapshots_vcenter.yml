@@ -1,0 +1,210 @@
+---
+# tasks/delete_snapshots_vcenter.yml
+# Called once per vCenter via include_tasks loop in delete_snapshots.yml.
+# Expects:
+#   current_vc_host      - vCenter hostname (loop_var)
+#   vcenter_creds        - dict of {hostname: {host, user, password}}
+#   vms_by_vcenter       - dict of {hostname: [vm list]}
+#   snapshot_cutoff_iso  - ISO-8601 UTC cutoff; older snapshots are expired
+#   snap_pattern         - regex a snapshot name must match to be eligible
+#   snap_remove_children - also remove child snapshots (bool)
+#   snap_dry_run         - report only, delete nothing (bool)
+#   deletion_results     - list accumulating per-vCenter summaries
+
+- name: "Set working vars for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc: "{{ vcenter_creds[current_vc_host] }}"
+    _vms: "{{ vms_by_vcenter[current_vc_host] }}"
+    _snap_pairs: []
+    _expired: []
+    _unreadable: []
+
+- name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
+  ansible.builtin.debug:
+    msg: "No VMs assigned to {{ current_vc_host }} in CSV — skipping."
+  when: _vms | length == 0
+
+# ---------------------------------------------------------------------------
+# Phase 1 — read the existing snapshots for every VM on this vCenter
+# ---------------------------------------------------------------------------
+- name: "Fire async snapshot-info tasks for {{ current_vc_host }} ({{ _vms | length }} VMs)"
+  community.vmware.vmware_guest_snapshot_info:
+    hostname: "{{ _vc.host }}"
+    username: "{{ _vc.user }}"
+    password: "{{ _vc.password }}"
+    validate_certs: false
+    datacenter: "{{ item.datacenter }}"
+    folder: "/{{ item.datacenter }}/vm"
+    name: "{{ item.vm_name }}"
+  loop: "{{ _vms }}"
+  loop_control:
+    label: "{{ item.vm_name }}"
+  async: 300
+  poll: 0
+  ignore_errors: true
+  register: _async_info_jobs
+  when: _vms | length > 0
+
+- name: "Wait for all snapshot-info jobs on {{ current_vc_host }}"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ _async_info_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }}"
+  register: _info_results
+  until: _info_results.finished
+  retries: 60
+  delay: 5
+  ignore_errors: true
+  when: _vms | length > 0
+
+- name: "Record VMs whose snapshots could not be read on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _unreadable: >-
+      {{ _info_results.results
+         | default([])
+         | selectattr('failed', 'defined')
+         | selectattr('failed', 'equalto', true)
+         | map(attribute='item.item.vm_name')
+         | list }}
+  when: _vms | length > 0
+
+# Flatten every VM's snapshot list into one list of snapshot dicts, each
+# carrying the vm_name/datacenter it belongs to.
+- name: "Flatten VM/snapshot pairs for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _snap_pairs: >-
+      {{ _snap_pairs + (
+           (_res.guest_snapshots | default({})).snapshots | default([])
+           | map('combine', {
+               'vm_name': _res.item.item.vm_name,
+               'datacenter': _res.item.item.datacenter
+             })
+           | list
+         ) }}
+  loop: >-
+    {{ _info_results.results
+       | default([])
+       | selectattr('failed', 'defined')
+       | selectattr('failed', 'equalto', false)
+       | list }}
+  loop_control:
+    loop_var: _res
+    label: "{{ _res.item.item.vm_name }}"
+  when: _vms | length > 0
+
+# ---------------------------------------------------------------------------
+# Phase 2 — work out which of those snapshots are past the retention window
+# ---------------------------------------------------------------------------
+# creation_time is an ISO-8601 UTC string, so a plain string comparison
+# against the 19-character cutoff is a correct chronological comparison.
+- name: "Select expired snapshots on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _expired: >-
+      {{ _snap_pairs
+         | selectattr('creation_time', 'defined')
+         | rejectattr('creation_time', 'none')
+         | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
+         | selectattr('name', 'search', snap_pattern)
+         | list }}
+  when: _vms | length > 0
+
+- name: "Snapshots eligible for deletion on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.vm_name }} :: '{{ item.name }}'
+      created {{ item.creation_time }} (older than {{ snapshot_cutoff_iso }})
+  loop: "{{ _expired }}"
+  loop_control:
+    label: "{{ item.vm_name }} :: {{ item.name }}"
+
+- name: "Nothing to delete on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _snap_pairs | length }} snapshot(s) found on {{ current_vc_host }},
+      none older than {{ snap_retention_days }} days.
+  when:
+    - _vms | length > 0
+    - _expired | length == 0
+
+# ---------------------------------------------------------------------------
+# Phase 3 — delete them (skipped entirely in dry-run mode)
+# ---------------------------------------------------------------------------
+- name: "DRY RUN — {{ _expired | length }} snapshot(s) would be deleted on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: "Dry run enabled (delete_dry_run=true) — no snapshots were removed."
+  when:
+    - _expired | length > 0
+    - snap_dry_run | bool
+
+- name: "Fire async snapshot deletions for {{ current_vc_host }} ({{ _expired | length }} snapshots)"
+  community.vmware.vmware_guest_snapshot:
+    hostname: "{{ _vc.host }}"
+    username: "{{ _vc.user }}"
+    password: "{{ _vc.password }}"
+    validate_certs: false
+    datacenter: "{{ item.datacenter }}"
+    folder: "/{{ item.datacenter }}/vm"
+    name: "{{ item.vm_name }}"
+    state: absent
+    snapshot_name: "{{ item.name }}"
+    remove_children: "{{ snap_remove_children | bool }}"
+  loop: "{{ _expired }}"
+  loop_control:
+    label: "{{ item.vm_name }} :: {{ item.name }}"
+  async: 1800
+  poll: 0
+  ignore_errors: true
+  register: _async_del_jobs
+  when:
+    - _expired | length > 0
+    - not (snap_dry_run | bool)
+
+- name: "Wait for all deletion jobs on {{ current_vc_host }}"
+  ansible.builtin.async_status:
+    jid: "{{ item.ansible_job_id }}"
+  loop: "{{ _async_del_jobs.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }} :: {{ item.item.name }}"
+  register: _del_results
+  until: _del_results.finished
+  retries: 120
+  delay: 15
+  ignore_errors: true
+  when:
+    - _expired | length > 0
+    - not (snap_dry_run | bool)
+
+- name: "Append {{ current_vc_host }} results to deletion_results"
+  ansible.builtin.set_fact:
+    deletion_results: >-
+      {{ deletion_results + [{
+           'vcenter':    current_vc_host,
+           'total':      _vms | length,
+           'unreadable': _unreadable,
+           'snapshots':  _snap_pairs | length,
+           'expired':    _expired,
+           'deleted':    _del_results.results
+                         | default([])
+                         | selectattr('failed', 'defined')
+                         | selectattr('failed', 'equalto', false)
+                         | map(attribute='item.item')
+                         | list,
+           'failed':     _del_results.results
+                         | default([])
+                         | selectattr('failed', 'defined')
+                         | selectattr('failed', 'equalto', true)
+                         | map(attribute='item.item')
+                         | list
+         }] }}
+
+- name: "{{ current_vc_host }} — retention summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== {{ current_vc_host }} — retention: {{ snap_retention_days }} days (cutoff {{ snapshot_cutoff_iso }}) ==="
+      - "  VMs scanned       : {{ _vms | length }}"
+      - "  Unreadable VMs    : {{ _unreadable | length }}{{ ' -> ' ~ _unreadable | join(', ') if _unreadable else '' }}"
+      - "  Snapshots found   : {{ _snap_pairs | length }}"
+      - "  Expired snapshots : {{ _expired | length }}"
+      - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run)' if snap_dry_run | bool else '' }}"
+      - "  Failed            : {{ deletion_results[-1].failed | length }}"

@@ -34,7 +34,7 @@
 
     # CSV inventory path. Override at runtime with:
     #   -e "csv_file=/path/to/my_inventory.csv"
-    csv_file: "vm_inventory.csv"
+    csv_file: "{{ playbook_dir }}/vm_inventory.csv"
 
   tasks:
     - name: Ensure vCenter credentials are available from Vault
