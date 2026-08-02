@@ -1,0 +1,310 @@
+---
+# Playbook: delete_snapshots.yml
+#
+# Retention cleanup for the snapshots created by create_snapshots.yml.
+#
+# Fully non-interactive, exactly like create_snapshots.yml:
+#   * vCenter username & password are read from Ansible Vault
+#     (group_vars/all/vault.yml -> vault_vcenter_username / vault_vcenter_password).
+#   * vCenter hostnames are taken directly from the CSV `vcenter` column.
+#   * Every snapshot older than `snapshot_retention_days` (default 10) is removed.
+#
+# Safety:
+#   * Only snapshots whose NAME matches `snapshot_name_pattern`
+#     (default: "-security-update$") are considered, so unrelated snapshots
+#     taken by other teams/tools are never touched.
+#   * Run with -e "delete_dry_run=true" first to see exactly what would go.
+#
+# Run it with:
+#   ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass
+#   ansible-playbook -i inventory.ini delete_snapshots.yml --vault-password-file ~/.vault_pass
+#
+# CSV columns required (same file as create_snapshots.yml):
+#   vm_name    - VM display name in vCenter (must match exactly)
+#   datacenter - Datacenter the VM belongs to
+#   vcenter    - Hostname or IP of the vCenter that manages this VM
+
+- name: Load CSV inventory and work out the retention cutoff
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # vCenter credentials resolved from Vault-backed group_vars.
+    # See group_vars/all/vars.yml and group_vars/all/vault.yml.
+    vcenter_username: "{{ vault_vcenter_username }}"
+    vcenter_password: "{{ vault_vcenter_password }}"
+
+    # Delete snapshots older than this many days.
+    # Override at runtime with:  -e "snapshot_retention_days=14"
+    snapshot_retention_days: 10
+
+    # Only snapshots whose name matches this regular expression are eligible
+    # for deletion. The default matches the names create_snapshots.yml writes
+    # (yyyymmdd-security-update) and nothing else.
+    # Set to "" to consider EVERY snapshot regardless of name (dangerous).
+    snapshot_name_pattern: "-security-update$"
+
+    # Also delete any child snapshots of an expired snapshot. Left off so a
+    # newer child snapshot is never destroyed along with its expired parent —
+    # VMware consolidates the deleted delta into the parent instead.
+    snapshot_remove_children: false
+
+    # Report only — find expired snapshots but do not delete anything.
+    # Override at runtime with:  -e "delete_dry_run=true"
+    delete_dry_run: false
+
+    # Exit non-zero if a VM in the CSV could not be queried (renamed, moved or
+    # decommissioned). Off by default so a stale CSV row does not break a
+    # nightly cron run — unreadable VMs are always listed in the report either
+    # way. Override with:  -e "fail_on_unreadable=true"
+    fail_on_unreadable: false
+
+    # CSV inventory path. Override at runtime with:
+    #   -e "csv_file=/path/to/my_inventory.csv"
+    csv_file: "{{ playbook_dir }}/vm_inventory.csv"
+
+  tasks:
+    - name: Ensure vCenter credentials are available from Vault
+      ansible.builtin.assert:
+        that:
+          - vcenter_username is defined
+          - vcenter_username | length > 0
+          - vcenter_password is defined
+          - vcenter_password | length > 0
+        fail_msg: >-
+          vCenter credentials were not found. Define vault_vcenter_username and
+          vault_vcenter_password in group_vars/all/vault.yml (Ansible Vault) and
+          run the playbook with --ask-vault-pass or --vault-password-file.
+        quiet: true
+
+    - name: Validate retention period
+      ansible.builtin.assert:
+        that:
+          - snapshot_retention_days | int >= 1
+        fail_msg: >-
+          snapshot_retention_days must be a positive whole number of days
+          (got '{{ snapshot_retention_days }}').
+        quiet: true
+
+    - name: Verify PyVmomi is installed for the active Python interpreter
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python_interpreter | default(ansible_playbook_python) }}"
+          - "-c"
+          - "import pyVmomi"
+      register: _pyvmomi_check
+      changed_when: false
+      failed_when: false
+
+    - name: Abort if PyVmomi is missing
+      ansible.builtin.fail:
+        msg: >-
+          PyVmomi is not importable by the interpreter
+          '{{ ansible_python_interpreter | default(ansible_playbook_python) }}'.
+          Install it with:
+          {{ ansible_python_interpreter | default(ansible_playbook_python) }}
+          -m pip install --upgrade pyvmomi
+      when: _pyvmomi_check.rc != 0
+
+    - name: Validate CSV file exists
+      ansible.builtin.stat:
+        path: "{{ csv_file }}"
+      register: csv_stat
+
+    - name: Abort if CSV file not found
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' not found. Please check the path."
+      when: not csv_stat.stat.exists
+
+    - name: Load VM inventory from CSV
+      community.general.read_csv:
+        path: "{{ csv_file }}"
+      register: vm_csv_raw
+
+    - name: Validate CSV has required columns
+      ansible.builtin.fail:
+        msg: >
+          CSV is missing required columns. Required: vm_name, datacenter, vcenter.
+          Found: {{ vm_csv_raw.list[0].keys() | list }}
+      when: >
+        vm_csv_raw.list | length == 0 or
+        'vm_name' not in vm_csv_raw.list[0] or
+        'datacenter' not in vm_csv_raw.list[0] or
+        'vcenter' not in vm_csv_raw.list[0]
+
+    - name: Drop blank/incomplete CSV rows
+      ansible.builtin.set_fact:
+        vm_list: >-
+          {{ vm_csv_raw.list
+             | rejectattr('vm_name', 'equalto', '')
+             | rejectattr('vcenter', 'equalto', '')
+             | list }}
+
+    - name: Abort if the CSV has no usable rows
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' contains no VM rows."
+      when: vm_list | length == 0
+
+    # -----------------------------------------------------------------------
+    # Retention cutoff.
+    # Snapshot creation times come back from vCenter as ISO-8601 UTC strings
+    # (e.g. 2026-07-14T02:11:03.847293+00:00). Because ISO-8601 sorts
+    # lexicographically, an expired snapshot is simply one whose timestamp
+    # string is less than the cutoff string — no timezone maths required.
+    # -----------------------------------------------------------------------
+    - name: Compute the retention cutoff timestamp
+      ansible.builtin.set_fact:
+        snapshot_cutoff_epoch: "{{ (now(utc=true).timestamp() | int) - (snapshot_retention_days | int * 86400) }}"
+
+    - name: Render the cutoff as an ISO-8601 UTC string
+      ansible.builtin.set_fact:
+        snapshot_cutoff_iso: "{{ '%Y-%m-%dT%H:%M:%S' | strftime(snapshot_cutoff_epoch, utc=true) }}"
+
+    - name: Extract unique vCenter hostnames from CSV
+      ansible.builtin.set_fact:
+        vcenter_hosts: "{{ vm_list | map(attribute='vcenter') | unique | list | sort }}"
+
+    - name: Show vCenters detected in CSV
+      ansible.builtin.debug:
+        msg:
+          - "Detected {{ vcenter_hosts | length }} vCenter(s) in CSV:"
+          - "{{ vcenter_hosts }}"
+
+    - name: Build vCenter credentials map (shared Vault credentials for all vCenters)
+      ansible.builtin.set_fact:
+        vcenter_creds: >-
+          {{ vcenter_creds | default({}) | combine({
+               item: {
+                 'host': item,
+                 'user': vcenter_username,
+                 'password': vcenter_password
+               }
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+    - name: Build VMs-by-vCenter map
+      ansible.builtin.set_fact:
+        vms_by_vcenter: >-
+          {{ vms_by_vcenter | default({}) | combine({
+               item: vm_list | selectattr('vcenter', 'equalto', item) | list
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+
+    - name: Store retention settings and initialise results list
+      ansible.builtin.set_fact:
+        snap_pattern: "{{ snapshot_name_pattern }}"
+        snap_retention_days: "{{ snapshot_retention_days | int }}"
+        snap_remove_children: "{{ snapshot_remove_children | bool }}"
+        snap_dry_run: "{{ delete_dry_run | bool }}"
+        snap_fail_on_unreadable: "{{ fail_on_unreadable | bool }}"
+        deletion_results: []
+        cacheable: false
+
+    - name: Retention summary
+      ansible.builtin.debug:
+        msg: >-
+          CSV loaded: {{ vm_list | length }} VMs across
+          {{ vcenter_hosts | length }} vCenter(s).
+          Retention: {{ snap_retention_days }} days —
+          deleting snapshots created before {{ snapshot_cutoff_iso }} UTC.
+          Name filter: '{{ snap_pattern if snap_pattern else '(none — all snapshots)' }}'.
+          {{ 'DRY RUN — nothing will be deleted.' if snap_dry_run else '' }}
+          {% for vc in vcenter_hosts %}
+          {{ vc }}: {{ vms_by_vcenter[vc] | length }} VMs
+          {% endfor %}
+
+# ---------------------------------------------------------------------------
+# Delete expired snapshots — one include_tasks per vCenter (dynamic, any count)
+# ---------------------------------------------------------------------------
+- name: Delete expired snapshots on all vCenters
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Process snapshot retention for each vCenter
+      ansible.builtin.include_tasks: tasks/delete_snapshots_vcenter.yml
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        loop_var: current_vc_host
+        label: "{{ current_vc_host }}"
+
+# ---------------------------------------------------------------------------
+# Combined final report
+# ---------------------------------------------------------------------------
+- name: Final combined report
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Per-vCenter deletion results
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ item.vcenter }} ==="
+          - "  VMs scanned      : {{ item.total }}"
+          - "  Unreadable VMs   : {{ item.unreadable | length }}"
+          - "  Expired snapshots: {{ item.expired | length }}"
+          - "  Deleted          : {{ item.deleted | length }}"
+          - "  Failed           : {{ item.failed | length }}"
+      loop: "{{ deletion_results }}"
+      loop_control:
+        label: "{{ item.vcenter }}"
+
+    - name: Overall retention report
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " SNAPSHOT RETENTION RUN COMPLETE"
+          - "========================================="
+          - " Mode           : {{ 'DRY RUN (nothing deleted)' if snap_dry_run else 'DELETE' }}"
+          - " Retention      : {{ snap_retention_days }} days"
+          - " Cutoff (UTC)   : {{ snapshot_cutoff_iso }}"
+          - " Name filter    : {{ snap_pattern if snap_pattern else '(none — all snapshots)' }}"
+          - " CSV inventory  : {{ vm_list | length }} VMs total"
+          - " vCenters       : {{ vcenter_hosts | length }}"
+          - "-----------------------------------------"
+          - " Expired found   : {{ deletion_results | map(attribute='expired') | map('length') | sum }}"
+          - " Total deleted   : {{ deletion_results | map(attribute='deleted') | map('length') | sum }}"
+          - " Total failed    : {{ deletion_results | map(attribute='failed') | map('length') | sum }}"
+          - " Unreadable VMs  : {{ deletion_results | map(attribute='unreadable') | map('length') | sum }}"
+          - "========================================="
+
+    - name: List all failed deletions across all vCenters
+      ansible.builtin.debug:
+        msg: "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }} :: {{ item.1.name }}"
+      loop: >-
+        {{ deletion_results
+           | selectattr('failed', 'ne', [])
+           | subelements('failed') }}
+      loop_control:
+        label: "{{ item.1.vm_name }} :: {{ item.1.name }}"
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0
+
+    - name: List all VMs whose snapshots could not be read
+      ansible.builtin.debug:
+        msg: "UNREADABLE on {{ item.0.vcenter }}: {{ item.1 }}"
+      loop: >-
+        {{ deletion_results
+           | selectattr('unreadable', 'ne', [])
+           | subelements('unreadable') }}
+      loop_control:
+        label: "{{ item.1 }}"
+      when: deletion_results | map(attribute='unreadable') | map('length') | sum > 0
+
+    - name: Fail playbook if any deletion failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ deletion_results | map(attribute='failed') | map('length') | sum }}
+          snapshot(s) failed to delete. See list above.
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0
+
+    - name: Fail playbook if any VM could not be queried
+      ansible.builtin.fail:
+        msg: >-
+          {{ deletion_results | map(attribute='unreadable') | map('length') | sum }}
+          VM(s) in the CSV could not be queried on vCenter. See list above.
+      when:
+        - snap_fail_on_unreadable | bool
+        - deletion_results | map(attribute='unreadable') | map('length') | sum > 0
