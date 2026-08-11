@@ -317,7 +317,9 @@
 
     - name: List all failed deletions across all vCenters
       ansible.builtin.debug:
-        msg: "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }} :: {{ item.1.name }}"
+        msg:
+          - "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }} :: {{ item.1.name }}"
+          - "  reason: {{ item.1.msg | default('(no message returned)') }}"
       loop: >-
         {{ deletion_results
            | selectattr('failed', 'ne', [])

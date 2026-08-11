@@ -233,7 +233,8 @@
           - "  Total VMs : {{ item.total }}"
           - "  Succeeded : {{ item.succeeded | length }}"
           - "  Failed    : {{ item.failed | length }}"
-          - "  Failed VMs: {{ item.failed if item.failed else 'none' }}"
+          - "  Failed VMs: {{ item.failed | map(attribute='vm_name') | list
+                              if item.failed else 'none' }}"
       loop: "{{ snapshot_results }}"
       loop_control:
         label: "{{ item.vcenter }}"
@@ -252,15 +253,17 @@
           - " Total failed    : {{ snapshot_results | map(attribute='failed') | map('length') | sum }}"
           - "========================================="
 
-    - name: List all failed VMs across all vCenters
+    - name: List all failed VMs across all vCenters, with the reason
       ansible.builtin.debug:
-        msg: "FAILED on {{ item.0.vcenter }}: {{ item.1 }}"
+        msg:
+          - "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }}"
+          - "  reason: {{ item.1.msg }}"
       loop: >-
         {{ snapshot_results
            | selectattr('failed', 'ne', [])
            | subelements('failed') }}
       loop_control:
-        label: "{{ item.1 }}"
+        label: "{{ item.1.vm_name }}"
       when: snapshot_results | map(attribute='failed') | map('length') | sum > 0
 
     - name: Fail playbook if any snapshot failed

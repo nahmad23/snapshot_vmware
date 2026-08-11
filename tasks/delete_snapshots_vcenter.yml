@@ -18,6 +18,7 @@
     _snap_pairs: []
     _expired: []
     _unreadable: []
+    _del_failed_details: []
 
 - name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
   ansible.builtin.debug:
@@ -175,6 +176,25 @@
     - _expired | length > 0
     - not (snap_dry_run | bool)
 
+# Keep the reason each deletion failed, not just which snapshot it was.
+- name: "Collect deletion failure reasons for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _del_failed_details: >-
+      {{ _del_failed_details | default([]) + [
+           _r.item.item | combine({
+             'msg': (_r.msg | default('(no message returned)')) | string | trim
+           })
+         ] }}
+  loop: >-
+    {{ _del_results.results
+       | default([])
+       | selectattr('failed', 'defined')
+       | selectattr('failed', 'equalto', true)
+       | list }}
+  loop_control:
+    loop_var: _r
+    label: "{{ _r.item.item.vm_name }} :: {{ _r.item.item.name }}"
+
 - name: "Append {{ current_vc_host }} results to deletion_results"
   ansible.builtin.set_fact:
     deletion_results: >-
@@ -190,12 +210,7 @@
                          | selectattr('failed', 'equalto', false)
                          | map(attribute='item.item')
                          | list,
-           'failed':     _del_results.results
-                         | default([])
-                         | selectattr('failed', 'defined')
-                         | selectattr('failed', 'equalto', true)
-                         | map(attribute='item.item')
-                         | list
+           'failed':     _del_failed_details | default([])
          }] }}
 
 - name: "{{ current_vc_host }} — retention summary"
