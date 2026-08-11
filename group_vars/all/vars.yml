@@ -31,7 +31,7 @@ vcenter_password: "{{ vault_vcenter_password }}"
 # vCenter X" message naming the vCenter, instead of a raw undefined-variable
 # traceback.
 vcenter_credentials:
-  # OVH Private Cloud vCenter (https://pcc-145-239-250-43.ovh.de)
-  pcc-145-239-250-43.ovh.de:
+  # OVH Private Cloud vCenter (https://pcc-51-68-8-97.ovh.com)
+  pcc-51-68-8-97.ovh.com:
     username: "{{ vault_ovh_vcenter_username | default('') }}"
     password: "{{ vault_ovh_vcenter_password | default('') }}"
