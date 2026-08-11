@@ -83,8 +83,8 @@ appears in the CSV**:
 
 ```yaml
 vcenter_credentials:
-  # OVH Private Cloud vCenter (https://pcc-51-68-8-97.ovh.com)
-  pcc-51-68-8-97.ovh.com:
+  # OVH Private Cloud vCenter (https://pcc-145-239-250-43.ovh.de)
+  pcc-145-239-250-43.ovh.de:
     username: "{{ vault_ovh_vcenter_username | default('') }}"
     password: "{{ vault_ovh_vcenter_password | default('') }}"
 ```
@@ -115,7 +115,7 @@ of every run:
 
 ```
 ggnsitvmw01v.unitedlex.global -> shared default credentials
-pcc-51-68-8-97.ovh.com     -> dedicated credentials (vcenter_credentials)
+pcc-145-239-250-43.ovh.de     -> dedicated credentials (vcenter_credentials)
 ```
 
 If a vCenter ends up with an empty username or password — usually a misspelled
@@ -140,12 +140,12 @@ vm_name,datacenter,vcenter
 web-server-01,DatacenterA,vc1.example.com
 db-server-01,DatacenterA,vc1.example.com
 app-server-01,DatacenterB,vc2.example.com
-ovh-vm-01,YourOvhDatacenter,pcc-51-68-8-97.ovh.com
+ovh-vm-01,YourOvhDatacenter,pcc-145-239-250-43.ovh.de
 ```
 
 The `vcenter` column is normalised to a bare lowercase hostname before use, so
-pasting a full URL (`https://pcc-51-68-8-97.ovh.com/ui`) still resolves to
-`pcc-51-68-8-97.ovh.com` and matches its `vcenter_credentials` entry.
+pasting a full URL (`https://pcc-145-239-250-43.ovh.de/ui`) still resolves to
+`pcc-145-239-250-43.ovh.de` and matches its `vcenter_credentials` entry.
 Blank rows are ignored.
 
 > Do **not** put `#` comment lines in the CSV — it is parsed as plain CSV and a

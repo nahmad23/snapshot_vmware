@@ -35,7 +35,7 @@ vault_vcenter_username: "administrator@vsphere.local"
 vault_vcenter_password: "CHANGE_ME"
 
 # ---------------------------------------------------------------------------
-# OVH Private Cloud vCenter (pcc-51-68-8-97.ovh.com) — its own login.
+# OVH Private Cloud vCenter (pcc-145-239-250-43.ovh.de) — its own login.
 # Referenced from vcenter_credentials in group_vars/all/vars.yml.
 # ---------------------------------------------------------------------------
 vault_ovh_vcenter_username: "CHANGE_ME@ovh.local"
