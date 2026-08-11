@@ -22,8 +22,9 @@
   gather_facts: false
 
   vars:
-    # vCenter credentials resolved from Vault-backed group_vars.
-    # See group_vars/all/vars.yml and group_vars/all/vault.yml.
+    # Default vCenter credentials, resolved from Vault-backed group_vars.
+    # Per-vCenter overrides live in vcenter_credentials — see
+    # group_vars/all/vars.yml and group_vars/all/vault.yml.
     vcenter_username: "{{ vault_vcenter_username }}"
     vcenter_password: "{{ vault_vcenter_password }}"
 
@@ -37,7 +38,7 @@
     csv_file: "{{ playbook_dir }}/vm_inventory.csv"
 
   tasks:
-    - name: Ensure vCenter credentials are available from Vault
+    - name: Ensure default vCenter credentials are available from Vault
       ansible.builtin.assert:
         that:
           - vcenter_username is defined
@@ -45,9 +46,10 @@
           - vcenter_password is defined
           - vcenter_password | length > 0
         fail_msg: >-
-          vCenter credentials were not found. Define vault_vcenter_username and
-          vault_vcenter_password in group_vars/all/vault.yml (Ansible Vault) and
-          run the playbook with --ask-vault-pass or --vault-password-file.
+          Default vCenter credentials were not found. Define
+          vault_vcenter_username and vault_vcenter_password in
+          group_vars/all/vault.yml (Ansible Vault) and run the playbook with
+          --ask-vault-pass or --vault-password-file.
         quiet: true
 
     - name: Verify PyVmomi is installed for the active Python interpreter
@@ -83,22 +85,49 @@
     - name: Load VM inventory from CSV
       community.general.read_csv:
         path: "{{ csv_file }}"
-      register: vm_csv
+      register: vm_csv_raw
 
     - name: Validate CSV has required columns
       ansible.builtin.fail:
         msg: >
           CSV is missing required columns. Required: vm_name, datacenter, vcenter.
-          Found: {{ vm_csv.list[0].keys() | list }}
+          Found: {{ vm_csv_raw.list[0].keys() | list }}
       when: >
-        vm_csv.list | length == 0 or
-        'vm_name' not in vm_csv.list[0] or
-        'datacenter' not in vm_csv.list[0] or
-        'vcenter' not in vm_csv.list[0]
+        vm_csv_raw.list | length == 0 or
+        'vm_name' not in vm_csv_raw.list[0] or
+        'datacenter' not in vm_csv_raw.list[0] or
+        'vcenter' not in vm_csv_raw.list[0]
+
+    # The `vcenter` column is also the key used to look up per-vCenter
+    # credentials, so it is normalised to a bare lowercase hostname first:
+    # "https://pcc-1-2-3-4.ovh.de/ui" -> "pcc-1-2-3-4.ovh.de". This means a
+    # URL pasted into the CSV still matches its vcenter_credentials entry.
+    - name: Normalise the vcenter column and drop blank rows
+      ansible.builtin.set_fact:
+        vm_list: >-
+          {{ vm_list | default([]) + [
+               item | combine({
+                 'vcenter': item.vcenter
+                            | regex_replace('^\s*[A-Za-z][A-Za-z0-9+.-]*:/*', '')
+                            | regex_replace('/.*$', '')
+                            | trim | lower
+               })
+             ] }}
+      loop: "{{ vm_csv_raw.list }}"
+      loop_control:
+        label: "{{ item.vm_name | default('(blank)') }}"
+      when:
+        - item.vm_name is truthy
+        - item.vcenter is truthy
+
+    - name: Abort if the CSV has no usable rows
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' contains no VM rows."
+      when: vm_list | default([]) | length == 0
 
     - name: Extract unique vCenter hostnames from CSV
       ansible.builtin.set_fact:
-        vcenter_hosts: "{{ vm_csv.list | map(attribute='vcenter') | unique | list | sort }}"
+        vcenter_hosts: "{{ vm_list | map(attribute='vcenter') | unique | list | sort }}"
 
     - name: Show vCenters detected in CSV
       ansible.builtin.debug:
@@ -106,16 +135,44 @@
           - "Detected {{ vcenter_hosts | length }} vCenter(s) in CSV:"
           - "{{ vcenter_hosts }}"
 
-    - name: Build vCenter credentials map (shared Vault credentials for all vCenters)
+    # Each vCenter uses its own entry from vcenter_credentials if one exists,
+    # otherwise it falls back to the shared vcenter_username/vcenter_password.
+    - name: Build vCenter credentials map (per-vCenter, with shared fallback)
       ansible.builtin.set_fact:
         vcenter_creds: >-
           {{ vcenter_creds | default({}) | combine({
                item: {
                  'host': item,
-                 'user': vcenter_username,
-                 'password': vcenter_password
+                 'user': (vcenter_credentials | default({})).get(item, {}).get('username', vcenter_username),
+                 'password': (vcenter_credentials | default({})).get(item, {}).get('password', vcenter_password)
                }
              }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+    - name: Show which credential set each vCenter will use
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }} -> {{ 'dedicated credentials (vcenter_credentials)'
+                           if item in (vcenter_credentials | default({}))
+                           else 'shared default credentials' }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Ensure every vCenter resolved to a usable username and password
+      ansible.builtin.assert:
+        that:
+          - vcenter_creds[item].user | default('', true) | length > 0
+          - vcenter_creds[item].password | default('', true) | length > 0
+        fail_msg: >-
+          No usable credentials for vCenter '{{ item }}'. Either add an entry
+          for it under vcenter_credentials in group_vars/all/vars.yml pointing
+          at vault variables, or make sure the shared vault_vcenter_username /
+          vault_vcenter_password are set in group_vars/all/vault.yml.
+        quiet: true
       loop: "{{ vcenter_hosts }}"
       loop_control:
         label: "{{ item }}"
@@ -125,7 +182,7 @@
       ansible.builtin.set_fact:
         vms_by_vcenter: >-
           {{ vms_by_vcenter | default({}) | combine({
-               item: vm_csv.list | selectattr('vcenter', 'equalto', item) | list
+               item: vm_list | selectattr('vcenter', 'equalto', item) | list
              }) }}
       loop: "{{ vcenter_hosts }}"
 
@@ -139,7 +196,7 @@
     - name: Inventory summary
       ansible.builtin.debug:
         msg: >-
-          CSV loaded: {{ vm_csv.list | length }} total VMs across
+          CSV loaded: {{ vm_list | length }} total VMs across
           {{ vcenter_hosts | length }} vCenter(s).
           Snapshot name: {{ snap_name }}.
           {% for vc in vcenter_hosts %}
@@ -188,7 +245,7 @@
           - " SNAPSHOT RUN COMPLETE"
           - "========================================="
           - " Snapshot name : {{ snap_name }}"
-          - " CSV inventory : {{ vm_csv.list | length }} VMs total"
+          - " CSV inventory : {{ vm_list | length }} VMs total"
           - " vCenters      : {{ vcenter_hosts | length }}"
           - "-----------------------------------------"
           - " Total succeeded : {{ snapshot_results | map(attribute='succeeded') | map('length') | sum }}"

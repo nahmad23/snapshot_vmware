@@ -3,9 +3,35 @@
 #
 # Non-secret variables, automatically loaded for localhost.
 # These reference the secret values stored (encrypted) in vault.yml.
-# Keeping the indirection here means the playbook references plain names
-# (vcenter_username / vcenter_password) while the actual secrets live only
-# inside the encrypted vault.yml.
+# Keeping the indirection here means the playbooks reference plain names
+# while the actual secrets live only inside the encrypted vault.yml.
 
+# ---------------------------------------------------------------------------
+# Default credentials
+# ---------------------------------------------------------------------------
+# Used for every vCenter that does not have its own entry in
+# vcenter_credentials below.
 vcenter_username: "{{ vault_vcenter_username }}"
 vcenter_password: "{{ vault_vcenter_password }}"
+
+# ---------------------------------------------------------------------------
+# Per-vCenter credential overrides
+# ---------------------------------------------------------------------------
+# Some vCenters use their own login rather than the shared one above. Add an
+# entry here keyed by the vCenter's HOSTNAME exactly as it appears in the
+# `vcenter` column of vm_inventory.csv (bare hostname — no https://, no path).
+#
+# Any vCenter NOT listed here falls back to vcenter_username/vcenter_password,
+# so existing vCenters keep working untouched.
+#
+# The values must point at variables defined in the encrypted vault.yml —
+# never write a real password in this file, it is committed to git.
+# The `| default('')` is deliberate: if the vault variable is missing or
+# misspelled, the playbook stops with a clear "no usable credentials for
+# vCenter X" message naming the vCenter, instead of a raw undefined-variable
+# traceback.
+vcenter_credentials:
+  # OVH Private Cloud vCenter (https://pcc-145-239-250-43.ovh.de)
+  pcc-145-239-250-43.ovh.de:
+    username: "{{ vault_ovh_vcenter_username | default('') }}"
+    password: "{{ vault_ovh_vcenter_password | default('') }}"
