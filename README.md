@@ -67,12 +67,63 @@ vault_vcenter_password: "your-real-password"
 ```
 
 `group_vars/all/vars.yml` (already provided, non-secret) wires those into the
-names the playbook uses:
+names the playbooks use:
 
 ```yaml
 vcenter_username: "{{ vault_vcenter_username }}"
 vcenter_password: "{{ vault_vcenter_password }}"
 ```
+
+## vCenters with their own credentials
+
+Not every vCenter shares one login. Any vCenter can be given its own username
+and password through the `vcenter_credentials` map in
+`group_vars/all/vars.yml`, keyed by the vCenter's **hostname exactly as it
+appears in the CSV**:
+
+```yaml
+vcenter_credentials:
+  # OVH Private Cloud vCenter (https://pcc-145-239-250-43.ovh.de)
+  pcc-145-239-250-43.ovh.de:
+    username: "{{ vault_ovh_vcenter_username | default('') }}"
+    password: "{{ vault_ovh_vcenter_password | default('') }}"
+```
+
+with the matching secrets in the encrypted `group_vars/all/vault.yml`:
+
+```yaml
+# shared / default login
+vault_vcenter_username: "administrator@vsphere.local"
+vault_vcenter_password: "your-real-password"
+
+# OVH vCenter's own login
+vault_ovh_vcenter_username: "your-ovh-user"
+vault_ovh_vcenter_password: "your-ovh-password"
+```
+
+Add them to an existing encrypted vault with:
+
+```bash
+ansible-vault edit group_vars/all/vault.yml
+```
+
+**Any vCenter not listed in `vcenter_credentials` keeps using the shared
+`vcenter_username`/`vcenter_password`**, so existing vCenters need no changes.
+
+Both playbooks print which credential set each vCenter resolved to at the start
+of every run:
+
+```
+ggnsitvmw01v.unitedlex.global -> shared default credentials
+pcc-145-239-250-43.ovh.de     -> dedicated credentials (vcenter_credentials)
+```
+
+If a vCenter ends up with an empty username or password — usually a misspelled
+vault variable — the run stops before touching vCenter with a message naming
+the vCenter in question.
+
+To add a third vCenter with its own login, add one block to
+`vcenter_credentials`, two variables to the vault, and its VM rows to the CSV.
 
 ## CSV Inventory Format
 
@@ -89,7 +140,16 @@ vm_name,datacenter,vcenter
 web-server-01,DatacenterA,vc1.example.com
 db-server-01,DatacenterA,vc1.example.com
 app-server-01,DatacenterB,vc2.example.com
+ovh-vm-01,YourOvhDatacenter,pcc-145-239-250-43.ovh.de
 ```
+
+The `vcenter` column is normalised to a bare lowercase hostname before use, so
+pasting a full URL (`https://pcc-145-239-250-43.ovh.de/ui`) still resolves to
+`pcc-145-239-250-43.ovh.de` and matches its `vcenter_credentials` entry.
+Blank rows are ignored.
+
+> Do **not** put `#` comment lines in the CSV — it is parsed as plain CSV and a
+> comment line would be read as a VM row.
 
 ## Usage
 

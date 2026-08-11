@@ -14,14 +14,29 @@
 #    (Or create + encrypt in one step:
 #      ansible-vault create group_vars/all/vault.yml )
 #
-# 4. Run the playbook supplying the vault password:
+# 4. Run the playbooks supplying the vault password:
 #      ansible-playbook -i inventory.ini create_snapshots.yml --ask-vault-pass
 #    or, with a password file:
 #      ansible-playbook -i inventory.ini create_snapshots.yml \
 #        --vault-password-file ~/.vault_pass
 #
+# To edit an already-encrypted vault file (e.g. to add the OVH credentials
+# below to an existing vault):
+#      ansible-vault edit group_vars/all/vault.yml
+#
 # The real (encrypted) group_vars/all/vault.yml is git-ignored so plaintext
 # secrets are never committed. Commit only the ENCRYPTED file if you choose to.
 
+# ---------------------------------------------------------------------------
+# Default credentials — used by every vCenter that has no override in
+# group_vars/all/vars.yml (vcenter_credentials).
+# ---------------------------------------------------------------------------
 vault_vcenter_username: "administrator@vsphere.local"
 vault_vcenter_password: "CHANGE_ME"
+
+# ---------------------------------------------------------------------------
+# OVH Private Cloud vCenter (pcc-145-239-250-43.ovh.de) — its own login.
+# Referenced from vcenter_credentials in group_vars/all/vars.yml.
+# ---------------------------------------------------------------------------
+vault_ovh_vcenter_username: "CHANGE_ME@ovh.local"
+vault_ovh_vcenter_password: "CHANGE_ME"
