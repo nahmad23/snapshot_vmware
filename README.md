@@ -231,7 +231,8 @@ ansible-playbook -i inventory.ini delete_snapshots.yml \
 2. Computes a cutoff timestamp of `now (UTC) − snapshot_retention_days`.
 3. Queries every VM in the CSV for its existing snapshots (asynchronously, per vCenter).
 4. Selects snapshots that are **both** older than the cutoff **and** whose name
-   matches `snapshot_name_pattern`.
+   matches `snapshot_name_pattern` **and** does not contain the protected
+   keyword `snapshot_protect_pattern`.
 5. Deletes them asynchronously — one failure never stops the rest.
 6. Prints per-vCenter and combined found/deleted/failed counts, and exits
    non-zero if any deletion failed.
@@ -253,10 +254,35 @@ the CSV is wrong.
 
 ## Safety
 
-The name filter is the important part. By default only snapshots whose name ends
-in `-security-update` — i.e. the ones `create_snapshots.yml` created — are ever
-eligible for deletion. A manual snapshot called `before-db-migration` is left
-alone no matter how old it is.
+The configured policy is **delete everything except protected names**:
+
+* `snapshot_name_pattern` is empty, so **every** snapshot on every VM in the CSV
+  is in scope once it passes the age cutoff — including snapshots this tooling
+  did not create.
+* `snapshot_protect_pattern` is `critical`, so any snapshot whose name contains
+  `critical` is **never** deleted, at any age.
+
+The keyword is matched **case-insensitively** and **anywhere in the name**, so
+all of these are protected:
+
+| Snapshot name | Protected? |
+|---|---|
+| `critical-db-state` | yes |
+| `CRITICAL-pre-upgrade` | yes |
+| `Backup-Critical-2026` | yes |
+| `criticality-review` | yes (contains `critical`) |
+| `manual-backup-old` | **no** — deleted once past the cutoff |
+
+Protection wins over everything else, including `snapshot_retention_days=0`.
+
+Because the scope is now every snapshot, a manual snapshot called
+`before-db-migration` **will** be deleted once it is older than the retention
+window. To go back to only removing snapshots `create_snapshots.yml` made:
+
+```bash
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
+  -e "snapshot_name_pattern=-security-update$"
+```
 
 Child snapshots are also protected: `snapshot_remove_children` is `false`, so
 deleting an expired parent consolidates its delta into the disk (standard VMware
@@ -269,7 +295,8 @@ All of these are overridable with `-e` at runtime:
 | Variable | Default | Description |
 |---|---|---|
 | `snapshot_retention_days` | `10` | Delete snapshots older than this many days. `0` disables the age check entirely — every snapshot matching the name filter is deleted, including ones taken today. Useful for cleaning up test snapshots on the spot; the run prints a loud warning |
-| `snapshot_name_pattern` | `-security-update$` | Regex a snapshot name must match to be eligible. Set to `""` to consider **every** snapshot (dangerous) |
+| `snapshot_name_pattern` | `""` (all snapshots) | Regex a snapshot name must match to be eligible. Empty means every snapshot is in scope. Set to `-security-update$` to limit deletion to snapshots this tooling created |
+| `snapshot_protect_pattern` | `critical` | Snapshots whose name contains this are never deleted, at any age. Matched case-insensitively, anywhere in the name. Setting it to `""` protects nothing |
 | `delete_dry_run` | `false` | Report expired snapshots without deleting anything |
 | `snapshot_remove_children` | `false` | Also delete child snapshots of an expired snapshot |
 | `fail_on_unreadable` | `false` | Exit non-zero if a CSV VM could not be queried (renamed/decommissioned). Off by default so a stale CSV row does not break a cron run — such VMs are always listed in the report |

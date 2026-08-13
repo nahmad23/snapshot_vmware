@@ -9,11 +9,17 @@
 #   * vCenter hostnames are taken directly from the CSV `vcenter` column.
 #   * Every snapshot older than `snapshot_retention_days` (default 10) is removed.
 #
+# Policy:
+#   * ALL snapshots are in scope by default (`snapshot_name_pattern` is empty),
+#     not just the ones this tooling created.
+#   * EXCEPT any snapshot whose name contains `snapshot_protect_pattern`
+#     ("critical", matched case-insensitively anywhere in the name). Those are
+#     never deleted, at any age.
+#
 # Safety:
-#   * Only snapshots whose NAME matches `snapshot_name_pattern`
-#     (default: "-security-update$") are considered, so unrelated snapshots
-#     taken by other teams/tools are never touched.
 #   * Run with -e "delete_dry_run=true" first to see exactly what would go.
+#   * Set snapshot_name_pattern="-security-update$" to narrow deletion back to
+#     only the snapshots create_snapshots.yml made.
 #
 # Run it with:
 #   ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass
@@ -40,10 +46,20 @@
     snapshot_retention_days: 10
 
     # Only snapshots whose name matches this regular expression are eligible
-    # for deletion. The default matches the names create_snapshots.yml writes
-    # (yyyymmdd-security-update) and nothing else.
-    # Set to "" to consider EVERY snapshot regardless of name (dangerous).
-    snapshot_name_pattern: "-security-update$"
+    # for deletion. Empty means EVERY snapshot is in scope regardless of name,
+    # which is the configured policy: delete everything except the protected
+    # names below.
+    # Set to "-security-update$" to limit deletion to snapshots this tooling
+    # created and leave every other snapshot alone.
+    snapshot_name_pattern: ""
+
+    # Snapshots whose name contains this are NEVER deleted, whatever their age
+    # and whatever snapshot_name_pattern says. Matched case-insensitively, so
+    # "critical", "CRITICAL" and "Critical" are all protected, anywhere in the
+    # name ("db-critical-pre-upgrade" is protected too).
+    # This is the last line of defence — set it to "" only if you genuinely
+    # want nothing protected.
+    snapshot_protect_pattern: "critical"
 
     # Also delete any child snapshots of an expired snapshot. Left off so a
     # newer child snapshot is never destroyed along with its expired parent —
@@ -96,9 +112,10 @@
         msg:
           - "*******************************************************"
           - " snapshot_retention_days=0 — THE AGE CHECK IS DISABLED."
-          - " EVERY snapshot matching '{{ snapshot_name_pattern }}' will be"
-          - " deleted, including ones created today."
-          - " Only the name filter is protecting anything now."
+          - " EVERY snapshot in scope will be deleted, including ones"
+          - " created today."
+          - " Name filter : '{{ snapshot_name_pattern | default('', true) or '(none — ALL snapshots)' }}'"
+          - " Protected   : names containing '{{ snapshot_protect_pattern }}'"
           - "*******************************************************"
       when: snapshot_retention_days | int == 0
 
@@ -251,8 +268,20 @@
              }) }}
       loop: "{{ vcenter_hosts }}"
 
+    # Build the protection regex once. The (?i) inline flag makes the match
+    # case-insensitive. An empty protect pattern becomes (?!) — a negative
+    # lookahead that can never match — so "protect nothing" does not
+    # accidentally turn into "protect everything".
+    - name: Build the case-insensitive protection pattern
+      ansible.builtin.set_fact:
+        snap_protect_regex: >-
+          {{ '(?i)' ~ snapshot_protect_pattern
+             if snapshot_protect_pattern | default('', true) | length > 0
+             else '(?!)' }}
+
     - name: Store retention settings and initialise results list
       ansible.builtin.set_fact:
+        snap_protect_pattern: "{{ snapshot_protect_pattern }}"
         snap_pattern: "{{ snapshot_name_pattern }}"
         snap_retention_days: "{{ snapshot_retention_days | int }}"
         snap_remove_children: "{{ snapshot_remove_children | bool }}"
@@ -268,7 +297,8 @@
           {{ vcenter_hosts | length }} vCenter(s).
           Retention: {{ snap_retention_days }} days —
           deleting snapshots created before {{ snapshot_cutoff_iso }} UTC.
-          Name filter: '{{ snap_pattern if snap_pattern else '(none — all snapshots)' }}'.
+          Name filter: '{{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}'.
+          Protected keyword: '{{ snap_protect_pattern if snap_protect_pattern else '(none)' }}' (case-insensitive).
           {{ 'DRY RUN — nothing will be deleted.' if snap_dry_run else '' }}
           {% for vc in vcenter_hosts %}
           {{ vc }}: {{ vms_by_vcenter[vc] | length }} VMs
@@ -319,7 +349,8 @@
           - " Mode           : {{ 'DRY RUN (nothing deleted)' if snap_dry_run else 'DELETE' }}"
           - " Retention      : {{ snap_retention_days }} days"
           - " Cutoff (UTC)   : {{ snapshot_cutoff_iso }}"
-          - " Name filter    : {{ snap_pattern if snap_pattern else '(none — all snapshots)' }}"
+          - " Name filter    : {{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}"
+          - " Protected      : names containing '{{ snap_protect_pattern }}' (any case)"
           - " CSV inventory  : {{ vm_list | length }} VMs total"
           - " vCenters       : {{ vcenter_hosts | length }}"
           - "-----------------------------------------"

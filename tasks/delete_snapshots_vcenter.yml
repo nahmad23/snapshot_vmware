@@ -107,8 +107,21 @@
          | rejectattr('creation_time', 'none')
          | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
          | selectattr('name', 'search', snap_pattern)
+         | rejectattr('name', 'search', snap_protect_regex)
          | list }}
   when: _vms | length > 0
+
+# Protected snapshots are reported separately so it is always visible that the
+# keyword actually saved something, rather than silently doing nothing.
+- name: "Protected snapshots on {{ current_vc_host }} (never deleted)"
+  ansible.builtin.debug:
+    msg: >-
+      PROTECTED: {{ item.vm_name }} :: '{{ item.name }}'
+      (name contains '{{ snap_protect_pattern }}')
+  loop: >-
+    {{ _snap_pairs | selectattr('name', 'search', snap_protect_regex) | list }}
+  loop_control:
+    label: "{{ item.vm_name }} :: {{ item.name }}"
 
 # Audit trail: every snapshot found and the verdict on it. Without this an
 # "Expired found: 0" run gives no clue whether the snapshots were too new,
@@ -120,9 +133,11 @@
       created {{ item.creation_time | default('unknown') }} ->
       {{ 'DELETE (older than cutoff)'
          if item in _expired
-         else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
-               if snap_pattern and not (item.name is search(snap_pattern))
-               else 'KEEP (newer than cutoff ' ~ snapshot_cutoff_iso ~ ')') }}
+         else ('KEEP (PROTECTED - name contains ' ~ snap_protect_pattern ~ ')'
+               if item.name is search(snap_protect_regex)
+               else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
+                     if snap_pattern and not (item.name is search(snap_pattern))
+                     else 'KEEP (newer than cutoff ' ~ snapshot_cutoff_iso ~ ')')) }}
   loop: "{{ _snap_pairs }}"
   loop_control:
     label: "{{ item.vm_name }} :: {{ item.name }}"
