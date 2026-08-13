@@ -82,11 +82,25 @@
     - name: Validate retention period
       ansible.builtin.assert:
         that:
-          - snapshot_retention_days | int >= 1
+          - snapshot_retention_days | int >= 0
         fail_msg: >-
-          snapshot_retention_days must be a positive whole number of days
+          snapshot_retention_days must be a whole number of days, 0 or more
           (got '{{ snapshot_retention_days }}').
         quiet: true
+
+    # 0 means "cutoff = now", i.e. delete every matching snapshot no matter how
+    # recent. Useful for cleaning up test snapshots the same day they were
+    # taken, but it removes today's snapshots too — so say so loudly.
+    - name: Warn when retention is 0 (age check disabled)
+      ansible.builtin.debug:
+        msg:
+          - "*******************************************************"
+          - " snapshot_retention_days=0 — THE AGE CHECK IS DISABLED."
+          - " EVERY snapshot matching '{{ snapshot_name_pattern }}' will be"
+          - " deleted, including ones created today."
+          - " Only the name filter is protecting anything now."
+          - "*******************************************************"
+      when: snapshot_retention_days | int == 0
 
     - name: Verify PyVmomi is installed for the active Python interpreter
       ansible.builtin.command:

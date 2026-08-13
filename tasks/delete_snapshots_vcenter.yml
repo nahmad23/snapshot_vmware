@@ -110,22 +110,42 @@
          | list }}
   when: _vms | length > 0
 
-- name: "Snapshots eligible for deletion on {{ current_vc_host }}"
+# Audit trail: every snapshot found and the verdict on it. Without this an
+# "Expired found: 0" run gives no clue whether the snapshots were too new,
+# were filtered out by name, or were never there at all.
+- name: "All snapshots found on {{ current_vc_host }} — retention verdict"
   ansible.builtin.debug:
     msg: >-
       {{ item.vm_name }} :: '{{ item.name }}'
-      created {{ item.creation_time }} (older than {{ snapshot_cutoff_iso }})
-  loop: "{{ _expired }}"
+      created {{ item.creation_time | default('unknown') }} ->
+      {{ 'DELETE (older than cutoff)'
+         if item in _expired
+         else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
+               if snap_pattern and not (item.name is search(snap_pattern))
+               else 'KEEP (newer than cutoff ' ~ snapshot_cutoff_iso ~ ')') }}
+  loop: "{{ _snap_pairs }}"
   loop_control:
     label: "{{ item.vm_name }} :: {{ item.name }}"
+
+- name: "No snapshots at all on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      No snapshots found on any of the {{ _vms | length }} VM(s) queried on
+      {{ current_vc_host }}. If you expected some, check the vm_name and
+      datacenter values in the CSV.
+  when:
+    - _vms | length > 0
+    - _snap_pairs | length == 0
 
 - name: "Nothing to delete on {{ current_vc_host }}"
   ansible.builtin.debug:
     msg: >-
       {{ _snap_pairs | length }} snapshot(s) found on {{ current_vc_host }},
-      none older than {{ snap_retention_days }} days.
+      none eligible for deletion (see the verdict list above).
+      Retention {{ snap_retention_days }} days, cutoff {{ snapshot_cutoff_iso }}.
   when:
     - _vms | length > 0
+    - _snap_pairs | length > 0
     - _expired | length == 0
 
 # ---------------------------------------------------------------------------

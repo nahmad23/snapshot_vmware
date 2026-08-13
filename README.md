@@ -236,6 +236,21 @@ ansible-playbook -i inventory.ini delete_snapshots.yml \
 6. Prints per-vCenter and combined found/deleted/failed counts, and exits
    non-zero if any deletion failed.
 
+## Reading the output
+
+Every snapshot found gets a verdict line, so a run that deletes nothing still
+explains itself:
+
+```
+ggnsitutl04v :: '20260703-security-update' created 2026-07-03T... -> DELETE (older than cutoff)
+ggnsitutl04v :: '20260810-security-update' created 2026-08-10T... -> KEEP (newer than cutoff 2026-08-03T13:58:06)
+ovh-vm-01    :: 'manual-before-upgrade'    created 2026-05-15T... -> KEEP (name does not match -security-update$)
+```
+
+If a VM has no snapshots at all, the run says so explicitly rather than
+silently reporting zero — that usually means the `vm_name` or `datacenter` in
+the CSV is wrong.
+
 ## Safety
 
 The name filter is the important part. By default only snapshots whose name ends
@@ -253,7 +268,7 @@ All of these are overridable with `-e` at runtime:
 
 | Variable | Default | Description |
 |---|---|---|
-| `snapshot_retention_days` | `10` | Delete snapshots older than this many days |
+| `snapshot_retention_days` | `10` | Delete snapshots older than this many days. `0` disables the age check entirely — every snapshot matching the name filter is deleted, including ones taken today. Useful for cleaning up test snapshots on the spot; the run prints a loud warning |
 | `snapshot_name_pattern` | `-security-update$` | Regex a snapshot name must match to be eligible. Set to `""` to consider **every** snapshot (dangerous) |
 | `delete_dry_run` | `false` | Report expired snapshots without deleting anything |
 | `snapshot_remove_children` | `false` | Also delete child snapshots of an expired snapshot |
