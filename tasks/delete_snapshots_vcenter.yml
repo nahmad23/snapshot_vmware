@@ -19,6 +19,11 @@
     _expired: []
     _unreadable: []
     _del_failed_details: []
+    _in_scope: []
+    _critical_all: []
+    _critical_retained: []
+    _expired_critical: []
+    _expired_regular: []
 
 - name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
   ansible.builtin.debug:
@@ -99,27 +104,50 @@
 # ---------------------------------------------------------------------------
 # creation_time is an ISO-8601 UTC string, so a plain string comparison
 # against the 19-character cutoff is a correct chronological comparison.
-- name: "Select expired snapshots on {{ current_vc_host }}"
+# Split the snapshots in scope into the two retention tiers, then apply each
+# tier's own cutoff. Critical snapshots live longer but are not immortal.
+- name: "Split snapshots into retention tiers on {{ current_vc_host }}"
   ansible.builtin.set_fact:
-    _expired: >-
+    _in_scope: >-
       {{ _snap_pairs
          | selectattr('creation_time', 'defined')
          | rejectattr('creation_time', 'none')
-         | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
          | selectattr('name', 'search', snap_pattern)
-         | rejectattr('name', 'search', snap_protect_regex)
          | list }}
   when: _vms | length > 0
 
-# Protected snapshots are reported separately so it is always visible that the
-# keyword actually saved something, rather than silently doing nothing.
-- name: "Protected snapshots on {{ current_vc_host }} (never deleted)"
+- name: "Select expired snapshots on {{ current_vc_host }} (both tiers)"
+  ansible.builtin.set_fact:
+    _critical_all: >-
+      {{ _in_scope | selectattr('name', 'search', snap_critical_regex) | list }}
+    _expired_critical: >-
+      {{ _in_scope
+         | selectattr('name', 'search', snap_critical_regex)
+         | selectattr('creation_time', 'lt', snapshot_critical_cutoff_iso)
+         | list }}
+    _expired_regular: >-
+      {{ _in_scope
+         | rejectattr('name', 'search', snap_critical_regex)
+         | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
+         | list }}
+  when: _vms | length > 0
+
+- name: "Combine both tiers into the deletion set for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _expired: "{{ _expired_regular + _expired_critical }}"
+    _critical_retained: >-
+      {{ _critical_all
+         | selectattr('creation_time', 'ge', snapshot_critical_cutoff_iso)
+         | list }}
+  when: _vms | length > 0
+
+- name: "Critical snapshots still within retention on {{ current_vc_host }}"
   ansible.builtin.debug:
     msg: >-
-      PROTECTED: {{ item.vm_name }} :: '{{ item.name }}'
-      (name contains '{{ snap_protect_pattern }}')
-  loop: >-
-    {{ _snap_pairs | selectattr('name', 'search', snap_protect_regex) | list }}
+      RETAINED (critical): {{ item.vm_name }} :: '{{ item.name }}'
+      created {{ item.creation_time }} — kept until
+      {{ snap_critical_retention_days }} days old
+  loop: "{{ _critical_retained }}"
   loop_control:
     label: "{{ item.vm_name }} :: {{ item.name }}"
 
@@ -131,12 +159,14 @@
     msg: >-
       {{ item.vm_name }} :: '{{ item.name }}'
       created {{ item.creation_time | default('unknown') }} ->
-      {{ 'DELETE (older than cutoff)'
+      {{ ('DELETE (CRITICAL, older than ' ~ snap_critical_retention_days ~ ' days)'
+          if item.name is search(snap_critical_regex)
+          else 'DELETE (older than ' ~ snap_retention_days ~ ' days)')
          if item in _expired
-         else ('KEEP (PROTECTED - name contains ' ~ snap_protect_pattern ~ ')'
-               if item.name is search(snap_protect_regex)
-               else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
-                     if snap_pattern and not (item.name is search(snap_pattern))
+         else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
+               if snap_pattern and not (item.name is search(snap_pattern))
+               else ('KEEP (CRITICAL, retained until ' ~ snap_critical_retention_days ~ ' days old)'
+                     if item.name is search(snap_critical_regex)
                      else 'KEEP (newer than cutoff ' ~ snapshot_cutoff_iso ~ ')')) }}
   loop: "{{ _snap_pairs }}"
   loop_control:
@@ -239,6 +269,10 @@
            'unreadable': _unreadable,
            'snapshots':  _snap_pairs | length,
            'expired':    _expired,
+           'critical_all':      _critical_all,
+           'critical_retained': _critical_retained,
+           'expired_critical':  _expired_critical,
+           'expired_regular':   _expired_regular,
            'deleted':    _del_results.results
                          | default([])
                          | selectattr('failed', 'defined')
@@ -255,6 +289,7 @@
       - "  VMs scanned       : {{ _vms | length }}"
       - "  Unreadable VMs    : {{ _unreadable | length }}{{ ' -> ' ~ _unreadable | join(', ') if _unreadable else '' }}"
       - "  Snapshots found   : {{ _snap_pairs | length }}"
-      - "  Expired snapshots : {{ _expired | length }}"
+      - "  Expired snapshots : {{ _expired | length }} ({{ _expired_regular | length }} regular + {{ _expired_critical | length }} critical)"
+      - "  Critical retained : {{ _critical_retained | length }} of {{ _critical_all | length }}"
       - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run)' if snap_dry_run | bool else '' }}"
       - "  Failed            : {{ deletion_results[-1].failed | length }}"

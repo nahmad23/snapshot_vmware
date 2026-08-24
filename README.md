@@ -6,7 +6,7 @@ inventory, across **any number** of vCenter servers:
 | Playbook | Purpose |
 |---|---|
 | `create_snapshots.yml` | Creates a `yyyymmdd-security-update` snapshot on every VM in the CSV |
-| `delete_snapshots.yml` | **Retention** — deletes those snapshots once they are older than 10 days |
+| `delete_snapshots.yml` | **Retention** — deletes snapshots after 10 days, or 30 days if the name contains `critical`, then emails a report |
 
 Both runs are **fully non-interactive** — there are no prompts during execution:
 
@@ -24,6 +24,8 @@ snapshot_vmware/
 ├── tasks/
 │   ├── snapshot_vcenter.yml         # per-vCenter snapshot creation logic
 │   └── delete_snapshots_vcenter.yml # per-vCenter retention/deletion logic
+├── templates/
+│   └── snapshot_report.html.j2      # HTML body of the email report
 ├── group_vars/
 │   └── all/
 │       ├── vars.yml               # maps vcenter_username/password -> vault vars
@@ -206,9 +208,10 @@ ansible-playbook -i inventory.ini create_snapshots.yml \
 
 # Snapshot retention — `delete_snapshots.yml`
 
-Deletes snapshots **older than 10 days** from every VM in the same CSV. It uses
-the same Vault credentials, the same CSV and the same multi-vCenter handling as
-`create_snapshots.yml`, so there is nothing extra to configure.
+Deletes snapshots from every VM in the same CSV on a **two-tier retention
+policy** — 30 days for names containing `critical`, 10 days for everything else
+— then emails an HTML summary. It uses the same Vault credentials, the same CSV
+and the same multi-vCenter handling as `create_snapshots.yml`.
 
 ```bash
 # See what WOULD be deleted — deletes nothing
@@ -254,26 +257,28 @@ the CSV is wrong.
 
 ## Safety
 
-The configured policy is **delete everything except protected names**:
+The configured policy is **two retention tiers based on the snapshot name**:
 
-* `snapshot_name_pattern` is empty, so **every** snapshot on every VM in the CSV
-  is in scope once it passes the age cutoff — including snapshots this tooling
-  did not create.
-* `snapshot_protect_pattern` is `critical`, so any snapshot whose name contains
-  `critical` is **never** deleted, at any age.
+| Snapshot name contains | Retention | Variable |
+|---|---|---|
+| `critical` (any case) | **30 days** | `snapshot_critical_retention_days` |
+| anything else | **10 days** | `snapshot_retention_days` |
 
-The keyword is matched **case-insensitively** and **anywhere in the name**, so
-all of these are protected:
+`snapshot_name_pattern` is empty, so **every** snapshot on every VM in the CSV
+is in scope — including snapshots this tooling did not create. The tier decides
+only *when* each one is deleted, not *whether*.
 
-| Snapshot name | Protected? |
-|---|---|
-| `critical-db-state` | yes |
-| `CRITICAL-pre-upgrade` | yes |
-| `Backup-Critical-2026` | yes |
-| `criticality-review` | yes (contains `critical`) |
-| `manual-backup-old` | **no** — deleted once past the cutoff |
+The keyword is matched **case-insensitively** and **anywhere in the name**:
 
-Protection wins over everything else, including `snapshot_retention_days=0`.
+| Snapshot name | Tier | Deleted after |
+|---|---|---|
+| `critical-db-state` | critical | 30 days |
+| `CRITICAL-pre-upgrade` | critical | 30 days |
+| `Backup-Critical-2026` | critical | 30 days |
+| `criticality-review` | critical | 30 days (contains `critical`) |
+| `manual-backup-old` | regular | 10 days |
+
+Critical snapshots are **not** immortal — they are deleted once past 30 days.
 
 Because the scope is now every snapshot, a manual snapshot called
 `before-db-migration` **will** be deleted once it is older than the retention
@@ -288,6 +293,50 @@ Child snapshots are also protected: `snapshot_remove_children` is `false`, so
 deleting an expired parent consolidates its delta into the disk (standard VMware
 behaviour) rather than destroying newer snapshots taken on top of it.
 
+## Email report
+
+Every run ends by emailing an HTML summary to the addresses in `email_to`,
+subject **"Vmware snapshot deletion report"**. It contains:
+
+* Total snapshots deleted, split into regular (10-day) and critical (30-day)
+* Number of `critical` snapshots still retained, and a table listing them
+* The servers/VMs snapshots were deleted from
+* Every deleted snapshot with its name, creation time, tier, vCenter and status
+* Any failed deletions with the vCenter error, and any VMs that could not be queried
+* A per-vCenter breakdown
+
+The email is sent **after** the deletions, so it always reflects what really
+happened — including failures. A dry run still sends the report, with
+`[DRY RUN]` prefixed to the subject and every row marked `WOULD DELETE`.
+
+If the send fails the run prints a prominent warning and continues; a failed
+email never hides a failed deletion, and the exit code still reflects the
+deletions.
+
+### SMTP configuration
+
+The defaults assume an unauthenticated local MTA on `localhost:25`, which is
+the usual setup on an Ansible controller. For a different relay:
+
+```bash
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
+  -e "smtp_host=smtp.unitedlex.com" -e "smtp_port=587" -e "smtp_secure=starttls"
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `smtp_host` | `localhost` | SMTP relay hostname |
+| `smtp_port` | `25` | SMTP port |
+| `smtp_secure` | `never` | `never`, `try`, `starttls` (587) or `always` (465) |
+| `email_to` | the two report recipients | List of recipients |
+| `email_from` | `vmware-snapshots@unitedlex.com` | Envelope sender — the relay must accept it |
+| `email_subject` | `Vmware snapshot deletion report` | Subject line |
+
+If the relay needs authentication, put `vault_smtp_username` and
+`vault_smtp_password` in the encrypted vault; they are picked up automatically.
+
+Skip the email for a one-off run with `-e "email_report=false"`.
+
 ## Options
 
 All of these are overridable with `-e` at runtime:
@@ -296,7 +345,9 @@ All of these are overridable with `-e` at runtime:
 |---|---|---|
 | `snapshot_retention_days` | `10` | Delete snapshots older than this many days. `0` disables the age check entirely — every snapshot matching the name filter is deleted, including ones taken today. Useful for cleaning up test snapshots on the spot; the run prints a loud warning |
 | `snapshot_name_pattern` | `""` (all snapshots) | Regex a snapshot name must match to be eligible. Empty means every snapshot is in scope. Set to `-security-update$` to limit deletion to snapshots this tooling created |
-| `snapshot_protect_pattern` | `critical` | Snapshots whose name contains this are never deleted, at any age. Matched case-insensitively, anywhere in the name. Setting it to `""` protects nothing |
+| `snapshot_critical_retention_days` | `30` | Retention for snapshots whose name contains the critical keyword |
+| `snapshot_critical_pattern` | `critical` | Snapshots whose name contains this get the longer critical retention. Matched case-insensitively, anywhere in the name |
+| `email_report` | `true` | Send the HTML summary email at the end of the run |
 | `delete_dry_run` | `false` | Report expired snapshots without deleting anything |
 | `snapshot_remove_children` | `false` | Also delete child snapshots of an expired snapshot |
 | `fail_on_unreadable` | `false` | Exit non-zero if a CSV VM could not be queried (renamed/decommissioned). Off by default so a stale CSV row does not break a cron run — such VMs are always listed in the report |

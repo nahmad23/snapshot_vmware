@@ -9,17 +9,18 @@
 #   * vCenter hostnames are taken directly from the CSV `vcenter` column.
 #   * Every snapshot older than `snapshot_retention_days` (default 10) is removed.
 #
-# Policy:
-#   * ALL snapshots are in scope by default (`snapshot_name_pattern` is empty),
-#     not just the ones this tooling created.
-#   * EXCEPT any snapshot whose name contains `snapshot_protect_pattern`
-#     ("critical", matched case-insensitively anywhere in the name). Those are
-#     never deleted, at any age.
+# Policy — two retention tiers based on the snapshot NAME:
+#   * Snapshots whose name contains "critical" (case-insensitive, anywhere in
+#     the name) are kept for `snapshot_critical_retention_days` (30) and
+#     deleted only after that.
+#   * Every other snapshot is kept for `snapshot_retention_days` (10).
 #
 # Safety:
 #   * Run with -e "delete_dry_run=true" first to see exactly what would go.
 #   * Set snapshot_name_pattern="-security-update$" to narrow deletion back to
 #     only the snapshots create_snapshots.yml made.
+#
+# An HTML summary is emailed at the end of the run — see the email_* vars.
 #
 # Run it with:
 #   ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass
@@ -41,25 +42,26 @@
     vcenter_username: "{{ vault_vcenter_username }}"
     vcenter_password: "{{ vault_vcenter_password }}"
 
-    # Delete snapshots older than this many days.
-    # Override at runtime with:  -e "snapshot_retention_days=14"
+    # Retention for ORDINARY snapshots (name does not contain the critical
+    # keyword). Override at runtime with:  -e "snapshot_retention_days=14"
     snapshot_retention_days: 10
 
+    # Retention for CRITICAL snapshots — those whose name contains
+    # snapshot_critical_pattern below. Kept longer, then deleted like any
+    # other snapshot once past this age.
+    snapshot_critical_retention_days: 30
+
     # Only snapshots whose name matches this regular expression are eligible
-    # for deletion. Empty means EVERY snapshot is in scope regardless of name,
-    # which is the configured policy: delete everything except the protected
-    # names below.
+    # for deletion at all. Empty means EVERY snapshot is in scope regardless of
+    # name; the two retention tiers below then decide when each one goes.
     # Set to "-security-update$" to limit deletion to snapshots this tooling
     # created and leave every other snapshot alone.
     snapshot_name_pattern: ""
 
-    # Snapshots whose name contains this are NEVER deleted, whatever their age
-    # and whatever snapshot_name_pattern says. Matched case-insensitively, so
-    # "critical", "CRITICAL" and "Critical" are all protected, anywhere in the
-    # name ("db-critical-pre-upgrade" is protected too).
-    # This is the last line of defence — set it to "" only if you genuinely
-    # want nothing protected.
-    snapshot_protect_pattern: "critical"
+    # Snapshots whose name contains this get the longer critical retention.
+    # Matched case-insensitively and anywhere in the name, so "critical",
+    # "CRITICAL", "Critical" and "db-critical-pre-upgrade" all qualify.
+    snapshot_critical_pattern: "critical"
 
     # Also delete any child snapshots of an expired snapshot. Left off so a
     # newer child snapshot is never destroyed along with its expired parent —
@@ -79,6 +81,31 @@
     # CSV inventory path. Override at runtime with:
     #   -e "csv_file=/path/to/my_inventory.csv"
     csv_file: "{{ playbook_dir }}/vm_inventory.csv"
+
+    # -----------------------------------------------------------------------
+    # Email report
+    # -----------------------------------------------------------------------
+    # Sent at the END of the run, after deletions, so it always reflects the
+    # real outcome — including failures. Set email_report=false to skip it.
+    email_report: true
+
+    email_to:
+      - "nawazish.ahmad@unitedlex.com"
+      - "ashok.makkar@unitedlex.com"
+    email_from: "vmware-snapshots@unitedlex.com"
+    email_subject: "Vmware snapshot deletion report"
+
+    # SMTP relay. The defaults assume a local MTA listening on 127.0.0.1:25,
+    # which is the usual setup on an Ansible controller. If your relay needs
+    # authentication, put the credentials in the vault as
+    # vault_smtp_username / vault_smtp_password.
+    smtp_host: "localhost"
+    smtp_port: 25
+    # "never" = plain SMTP, "starttls" = upgrade on port 587,
+    # "always" = implicit TLS on port 465, "try" = starttls if offered.
+    smtp_secure: "never"
+    smtp_username: "{{ vault_smtp_username | default('') }}"
+    smtp_password: "{{ vault_smtp_password | default('') }}"
 
   tasks:
     - name: Ensure default vCenter credentials are available from Vault
@@ -115,7 +142,7 @@
           - " EVERY snapshot in scope will be deleted, including ones"
           - " created today."
           - " Name filter : '{{ snapshot_name_pattern | default('', true) or '(none — ALL snapshots)' }}'"
-          - " Protected   : names containing '{{ snapshot_protect_pattern }}'"
+          - " Critical keyword: '{{ snapshot_critical_pattern }}' (also age-checked)"
           - "*******************************************************"
       when: snapshot_retention_days | int == 0
 
@@ -202,10 +229,12 @@
     - name: Compute the retention cutoff timestamp
       ansible.builtin.set_fact:
         snapshot_cutoff_epoch: "{{ (now(utc=true).timestamp() | int) - (snapshot_retention_days | int * 86400) }}"
+        snapshot_critical_cutoff_epoch: "{{ (now(utc=true).timestamp() | int) - (snapshot_critical_retention_days | int * 86400) }}"
 
     - name: Render the cutoff as an ISO-8601 UTC string
       ansible.builtin.set_fact:
         snapshot_cutoff_iso: "{{ '%Y-%m-%dT%H:%M:%S' | strftime(snapshot_cutoff_epoch, utc=true) }}"
+        snapshot_critical_cutoff_iso: "{{ '%Y-%m-%dT%H:%M:%S' | strftime(snapshot_critical_cutoff_epoch, utc=true) }}"
 
     - name: Extract unique vCenter hostnames from CSV
       ansible.builtin.set_fact:
@@ -268,20 +297,37 @@
              }) }}
       loop: "{{ vcenter_hosts }}"
 
-    # Build the protection regex once. The (?i) inline flag makes the match
-    # case-insensitive. An empty protect pattern becomes (?!) — a negative
-    # lookahead that can never match — so "protect nothing" does not
-    # accidentally turn into "protect everything".
-    - name: Build the case-insensitive protection pattern
+    # Build the critical-match regex once. The (?i) inline flag makes the match
+    # case-insensitive. An empty pattern becomes (?!) — a negative lookahead
+    # that can never match — so "no critical keyword" cannot accidentally turn
+    # into "everything is critical".
+    - name: Build the case-insensitive critical-keyword pattern
       ansible.builtin.set_fact:
-        snap_protect_regex: >-
-          {{ '(?i)' ~ snapshot_protect_pattern
-             if snapshot_protect_pattern | default('', true) | length > 0
+        snap_critical_regex: >-
+          {{ '(?i)' ~ snapshot_critical_pattern
+             if snapshot_critical_pattern | default('', true) | length > 0
              else '(?!)' }}
+
+    # These live in the play's vars block, which does not carry into the later
+    # plays, so pin them into a single fact the report play can read.
+    - name: Carry email settings into the reporting play
+      ansible.builtin.set_fact:
+        mailcfg:
+          report: "{{ email_report | bool }}"
+          to: "{{ email_to }}"
+          from: "{{ email_from }}"
+          subject: "{{ email_subject }}"
+          host: "{{ smtp_host }}"
+          port: "{{ smtp_port }}"
+          secure: "{{ smtp_secure }}"
+          username: "{{ smtp_username | default('', true) }}"
+          password: "{{ smtp_password | default('', true) }}"
+      no_log: true
 
     - name: Store retention settings and initialise results list
       ansible.builtin.set_fact:
-        snap_protect_pattern: "{{ snapshot_protect_pattern }}"
+        snap_critical_pattern: "{{ snapshot_critical_pattern }}"
+        snap_critical_retention_days: "{{ snapshot_critical_retention_days | int }}"
         snap_pattern: "{{ snapshot_name_pattern }}"
         snap_retention_days: "{{ snapshot_retention_days | int }}"
         snap_remove_children: "{{ snapshot_remove_children | bool }}"
@@ -298,7 +344,8 @@
           Retention: {{ snap_retention_days }} days —
           deleting snapshots created before {{ snapshot_cutoff_iso }} UTC.
           Name filter: '{{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}'.
-          Protected keyword: '{{ snap_protect_pattern if snap_protect_pattern else '(none)' }}' (case-insensitive).
+          Critical keyword: '{{ snap_critical_pattern if snap_critical_pattern else '(none)' }}' (case-insensitive)
+          kept {{ snap_critical_retention_days }} days, everything else {{ snap_retention_days }} days.
           {{ 'DRY RUN — nothing will be deleted.' if snap_dry_run else '' }}
           {% for vc in vcenter_hosts %}
           {{ vc }}: {{ vms_by_vcenter[vc] | length }} VMs
@@ -348,9 +395,10 @@
           - "========================================="
           - " Mode           : {{ 'DRY RUN (nothing deleted)' if snap_dry_run else 'DELETE' }}"
           - " Retention      : {{ snap_retention_days }} days"
-          - " Cutoff (UTC)   : {{ snapshot_cutoff_iso }}"
+          - " Cutoff regular : {{ snapshot_cutoff_iso }} ({{ snap_retention_days }} days)"
+          - " Cutoff critical: {{ snapshot_critical_cutoff_iso }} ({{ snap_critical_retention_days }} days)"
           - " Name filter    : {{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}"
-          - " Protected      : names containing '{{ snap_protect_pattern }}' (any case)"
+          - " Critical match : names containing '{{ snap_critical_pattern }}' (any case)"
           - " CSV inventory  : {{ vm_list | length }} VMs total"
           - " vCenters       : {{ vcenter_hosts | length }}"
           - "-----------------------------------------"
@@ -383,6 +431,75 @@
       loop_control:
         label: "{{ item.1 }}"
       when: deletion_results | map(attribute='unreadable') | map('length') | sum > 0
+
+    # -----------------------------------------------------------------------
+    # Email report
+    # -----------------------------------------------------------------------
+    # Flatten the per-vCenter results into report-ready lists. Each entry keeps
+    # the vCenter it came from so the email can show it.
+    - name: Build flat report lists
+      ansible.builtin.set_fact:
+        rpt_deleted: >-
+          {{ rpt_deleted | default([]) +
+             (item.deleted | map('combine', {'vcenter': item.vcenter}) | list) }}
+        rpt_failed: >-
+          {{ rpt_failed | default([]) +
+             (item.failed | map('combine', {'vcenter': item.vcenter}) | list) }}
+        rpt_critical_retained: >-
+          {{ rpt_critical_retained | default([]) +
+             (item.critical_retained | map('combine', {'vcenter': item.vcenter}) | list) }}
+      loop: "{{ deletion_results }}"
+      loop_control:
+        label: "{{ item.vcenter }}"
+
+    - name: Compute report totals
+      ansible.builtin.set_fact:
+        rpt_deleted_critical: >-
+          {{ rpt_deleted | default([]) | selectattr('name', 'search', snap_critical_regex) | list }}
+        rpt_deleted_regular: >-
+          {{ rpt_deleted | default([]) | rejectattr('name', 'search', snap_critical_regex) | list }}
+        rpt_vms: >-
+          {{ rpt_deleted | default([]) | map(attribute='vm_name') | unique | list | sort }}
+        rpt_generated: "{{ now(utc=true, fmt='%Y-%m-%d %H:%M:%S') }} UTC"
+
+    - name: Send the snapshot deletion report by email
+      community.general.mail:
+        host: "{{ mailcfg.host }}"
+        port: "{{ mailcfg.port }}"
+        username: "{{ mailcfg.username | ternary(mailcfg.username, omit) }}"
+        password: "{{ mailcfg.password | ternary(mailcfg.password, omit) }}"
+        secure: "{{ mailcfg.secure }}"
+        from: "{{ mailcfg.from }}"
+        to: "{{ mailcfg.to }}"
+        subject: >-
+          {{ '[DRY RUN] ' if snap_dry_run | bool else '' }}{{ mailcfg.subject }}
+        subtype: html
+        body: "{{ lookup('template', playbook_dir ~ '/templates/snapshot_report.html.j2') }}"
+      register: _mail_result
+      ignore_errors: true
+      when: mailcfg.report | bool
+
+    # A failed send must not be silent — the whole point is the report.
+    - name: Warn if the report email could not be sent
+      ansible.builtin.debug:
+        msg:
+          - "*******************************************************"
+          - " THE REPORT EMAIL WAS NOT SENT."
+          - " {{ _mail_result.msg | default('unknown error') }}"
+          - " Deletions above are unaffected — only the email failed."
+          - " Check smtp_host/smtp_port/smtp_secure and that the relay"
+          - " accepts mail from {{ mailcfg.from }}."
+          - "*******************************************************"
+      when:
+        - mailcfg.report | bool
+        - _mail_result.failed | default(false)
+
+    - name: Confirm the report email was sent
+      ansible.builtin.debug:
+        msg: "Report emailed to: {{ mailcfg.to | join(', ') }}"
+      when:
+        - mailcfg.report | bool
+        - not (_mail_result.failed | default(false))
 
     - name: Fail playbook if any deletion failed
       ansible.builtin.fail:

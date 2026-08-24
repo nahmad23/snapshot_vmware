@@ -40,3 +40,11 @@ vault_vcenter_password: "CHANGE_ME"
 # ---------------------------------------------------------------------------
 vault_ovh_vcenter_username: "CHANGE_ME@ovh.local"
 vault_ovh_vcenter_password: "CHANGE_ME"
+
+# ---------------------------------------------------------------------------
+# SMTP credentials for the email report in delete_snapshots.yml.
+# ONLY needed if your relay requires authentication — leave them out entirely
+# for an unauthenticated local MTA (the default).
+# ---------------------------------------------------------------------------
+# vault_smtp_username: "CHANGE_ME"
+# vault_smtp_password: "CHANGE_ME"

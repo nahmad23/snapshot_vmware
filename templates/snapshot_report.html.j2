@@ -1,0 +1,157 @@
+{# Email body for delete_snapshots.yml. Rendered with lookup('template'). #}
+{% set total_deleted = rpt_deleted | default([]) | length %}
+{% set total_failed = rpt_failed | default([]) | length %}
+{% set crit_deleted = rpt_deleted_critical | default([]) | length %}
+{% set reg_deleted = rpt_deleted_regular | default([]) | length %}
+{% set crit_available = rpt_critical_retained | default([]) | length %}
+{% set unreadable = deletion_results | map(attribute='unreadable') | map('length') | sum %}
+<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;">
+
+  <h2 style="margin:0 0 4px 0;">VMware Snapshot Deletion Report</h2>
+  <p style="margin:0 0 16px 0;color:#666;font-size:12px;">
+    Generated {{ rpt_generated }}
+    {% if snap_dry_run | bool %}
+      &nbsp;|&nbsp;<strong style="color:#b26a00;">DRY RUN — nothing was actually deleted</strong>
+    {% endif %}
+  </p>
+
+  <h3 style="margin:16px 0 6px 0;">Summary</h3>
+  <table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;">
+    <tr style="background:#f4f4f4;">
+      <td style="border:1px solid #ddd;"><strong>Total snapshots deleted</strong></td>
+      <td style="border:1px solid #ddd;text-align:right;"><strong>{{ total_deleted }}</strong></td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;">Regular snapshots deleted (older than {{ snap_retention_days }} days)</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ reg_deleted }}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;">CRITICAL snapshots deleted (older than {{ snap_critical_retention_days }} days)</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ crit_deleted }}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;">CRITICAL snapshots currently available (retained)</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ crit_available }}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;">Deletions that failed</td>
+      <td style="border:1px solid #ddd;text-align:right;{% if total_failed %}color:#b00020;font-weight:bold;{% endif %}">{{ total_failed }}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;">VMs that could not be queried</td>
+      <td style="border:1px solid #ddd;text-align:right;{% if unreadable %}color:#b26a00;{% endif %}">{{ unreadable }}</td>
+    </tr>
+  </table>
+
+  <p style="margin:12px 0 0 0;font-size:12px;color:#666;">
+    Retention policy: names containing "{{ snap_critical_pattern }}" (any case) are kept
+    {{ snap_critical_retention_days }} days; all other snapshots are kept {{ snap_retention_days }} days.
+  </p>
+
+  <h3 style="margin:24px 0 6px 0;">Servers with snapshots deleted ({{ rpt_vms | default([]) | length }})</h3>
+  {% if rpt_vms | default([]) | length > 0 %}
+  <p style="margin:0;">{{ rpt_vms | join(', ') }}</p>
+  {% else %}
+  <p style="margin:0;color:#666;">None — no snapshots met the deletion criteria this run.</p>
+  {% endif %}
+
+  <h3 style="margin:24px 0 6px 0;">Deleted snapshots</h3>
+  {% if total_deleted > 0 %}
+  <table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:13px;">
+    <tr style="background:#f4f4f4;">
+      <th style="border:1px solid #ddd;text-align:left;">VM</th>
+      <th style="border:1px solid #ddd;text-align:left;">Snapshot</th>
+      <th style="border:1px solid #ddd;text-align:left;">Created</th>
+      <th style="border:1px solid #ddd;text-align:left;">Type</th>
+      <th style="border:1px solid #ddd;text-align:left;">vCenter</th>
+      <th style="border:1px solid #ddd;text-align:left;">Status</th>
+    </tr>
+    {% for s in rpt_deleted %}
+    <tr>
+      <td style="border:1px solid #ddd;">{{ s.vm_name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.creation_time | default('unknown') }}</td>
+      <td style="border:1px solid #ddd;">{{ 'CRITICAL' if s.name is search(snap_critical_regex) else 'regular' }}</td>
+      <td style="border:1px solid #ddd;">{{ s.vcenter }}</td>
+      <td style="border:1px solid #ddd;color:{{ '#b26a00' if snap_dry_run | bool else '#0a7d28' }};">
+        {{ 'WOULD DELETE (dry run)' if snap_dry_run | bool else 'Deleted' }}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p style="margin:0;color:#666;">No snapshots were deleted in this run.</p>
+  {% endif %}
+
+  <h3 style="margin:24px 0 6px 0;">CRITICAL snapshots retained ({{ crit_available }})</h3>
+  {% if crit_available > 0 %}
+  <table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:13px;">
+    <tr style="background:#f4f4f4;">
+      <th style="border:1px solid #ddd;text-align:left;">VM</th>
+      <th style="border:1px solid #ddd;text-align:left;">Snapshot</th>
+      <th style="border:1px solid #ddd;text-align:left;">Created</th>
+      <th style="border:1px solid #ddd;text-align:left;">vCenter</th>
+    </tr>
+    {% for s in rpt_critical_retained %}
+    <tr>
+      <td style="border:1px solid #ddd;">{{ s.vm_name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.creation_time | default('unknown') }}</td>
+      <td style="border:1px solid #ddd;">{{ s.vcenter }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p style="margin:8px 0 0 0;font-size:12px;color:#666;">
+    These are still inside the {{ snap_critical_retention_days }}-day critical retention window
+    and were not touched.
+  </p>
+  {% else %}
+  <p style="margin:0;color:#666;">No CRITICAL snapshots are currently retained.</p>
+  {% endif %}
+
+  {% if total_failed > 0 %}
+  <h3 style="margin:24px 0 6px 0;color:#b00020;">Failed deletions ({{ total_failed }})</h3>
+  <table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:13px;">
+    <tr style="background:#f4f4f4;">
+      <th style="border:1px solid #ddd;text-align:left;">VM</th>
+      <th style="border:1px solid #ddd;text-align:left;">Snapshot</th>
+      <th style="border:1px solid #ddd;text-align:left;">vCenter</th>
+      <th style="border:1px solid #ddd;text-align:left;">Reason</th>
+    </tr>
+    {% for s in rpt_failed %}
+    <tr>
+      <td style="border:1px solid #ddd;">{{ s.vm_name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.name }}</td>
+      <td style="border:1px solid #ddd;">{{ s.vcenter }}</td>
+      <td style="border:1px solid #ddd;">{{ s.msg | default('(no message)') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  <h3 style="margin:24px 0 6px 0;">Per-vCenter breakdown</h3>
+  <table cellpadding="6" cellspacing="0" border="0" style="border-collapse:collapse;font-size:13px;">
+    <tr style="background:#f4f4f4;">
+      <th style="border:1px solid #ddd;text-align:left;">vCenter</th>
+      <th style="border:1px solid #ddd;text-align:right;">VMs</th>
+      <th style="border:1px solid #ddd;text-align:right;">Snapshots found</th>
+      <th style="border:1px solid #ddd;text-align:right;">Deleted</th>
+      <th style="border:1px solid #ddd;text-align:right;">Critical retained</th>
+      <th style="border:1px solid #ddd;text-align:right;">Failed</th>
+    </tr>
+    {% for r in deletion_results %}
+    <tr>
+      <td style="border:1px solid #ddd;">{{ r.vcenter }}</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ r.total }}</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ r.snapshots }}</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ r.deleted | length }}</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ r.critical_retained | length }}</td>
+      <td style="border:1px solid #ddd;text-align:right;">{{ r.failed | length }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p style="margin:24px 0 0 0;font-size:11px;color:#999;">
+    Generated automatically by delete_snapshots.yml on the Ansible controller.
+  </p>
+</div>
