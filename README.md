@@ -313,6 +313,26 @@ If the send fails the run prints a prominent warning and continues; a failed
 email never hides a failed deletion, and the exit code still reflects the
 deletions.
 
+### Two delivery methods
+
+`email_method` chooses how the message is sent:
+
+| Method | What it does | When to use it |
+|---|---|---|
+| `smtp` (default) | Opens its own SMTP connection to `smtp_host:smtp_port` | You know the relay and are allowed to send as `email_from` |
+| `sendmail` | Pipes the message into the local `sendmail` binary and lets the system MTA route it | Mail already works from the command line on this box (`mail`, `mailx`, `sendmail`) |
+
+```bash
+ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
+  -e "email_method=sendmail"
+```
+
+The `sendmail` method needs no host, port, TLS mode or sender permission of its
+own — it inherits whatever the system MTA is already configured to do. If other
+playbooks or scripts on the controller can already send mail, this is usually
+the method that works without further setup. Override the binary path with
+`-e "sendmail_path=/usr/sbin/sendmail"` if it lives elsewhere.
+
 ### SMTP configuration
 
 The defaults assume an unauthenticated local MTA on `localhost:25`, which is
@@ -325,7 +345,9 @@ ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
 
 | Variable | Default | Description |
 |---|---|---|
-| `smtp_host` | `localhost` | SMTP relay hostname |
+| `email_method` | `smtp` | `smtp` or `sendmail` — see above |
+| `sendmail_path` | `/usr/sbin/sendmail` | Binary used when `email_method=sendmail` |
+| `smtp_host` | `localhost` | SMTP relay hostname (`smtp` method only) |
 | `smtp_port` | `25` | SMTP port |
 | `smtp_secure` | `never` | `never`, `try`, `starttls` (587) or `always` (465) |
 | `email_to` | the two report recipients | List of recipients |

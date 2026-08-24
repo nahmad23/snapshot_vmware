@@ -95,7 +95,18 @@
     email_from: "vmware-snapshots@unitedlex.com"
     email_subject: "Vmware snapshot deletion report"
 
-    # SMTP relay. The defaults assume a local MTA listening on 127.0.0.1:25,
+    # How to deliver the report:
+    #   "smtp"     - talk SMTP directly to smtp_host:smtp_port (below).
+    #   "sendmail" - pipe the message into the local sendmail binary and let
+    #                the system MTA decide how to route it. Use this when mail
+    #                already works on this box from the command line (mail /
+    #                mailx / sendmail) — it needs no host, port or sender
+    #                permission of its own.
+    email_method: "smtp"
+    sendmail_path: "/usr/sbin/sendmail"
+
+    # SMTP relay. Only used when email_method is "smtp".
+    # The defaults assume a local MTA listening on 127.0.0.1:25,
     # which is the usual setup on an Ansible controller. If your relay needs
     # authentication, put the credentials in the vault as
     # vault_smtp_username / vault_smtp_password.
@@ -322,6 +333,8 @@
           secure: "{{ smtp_secure }}"
           username: "{{ smtp_username | default('', true) }}"
           password: "{{ smtp_password | default('', true) }}"
+          method: "{{ email_method }}"
+          sendmail: "{{ sendmail_path }}"
       no_log: true
 
     - name: Store retention settings and initialise results list
@@ -461,6 +474,7 @@
         rpt_vms: >-
           {{ rpt_deleted | default([]) | map(attribute='vm_name') | unique | list | sort }}
         rpt_generated: "{{ now(utc=true, fmt='%Y-%m-%d %H:%M:%S') }} UTC"
+        rpt_run_id: "{{ now(utc=true, fmt='%Y%m%d%H%M%S') }}"
 
     - name: Send the snapshot deletion report by email
       community.general.mail:
@@ -475,9 +489,48 @@
           {{ '[DRY RUN] ' if snap_dry_run | bool else '' }}{{ mailcfg.subject }}
         subtype: html
         body: "{{ lookup('template', playbook_dir ~ '/templates/snapshot_report.html.j2') }}"
-      register: _mail_result
+      register: _mail_smtp
       ignore_errors: true
-      when: mailcfg.report | bool
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'smtp'
+
+    # ---- sendmail delivery -------------------------------------------------
+    # Renders the full RFC822 message (headers + HTML body) and pipes it into
+    # the local MTA with -t, which reads the recipients from the To: header.
+    - name: Render the report message for sendmail
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/snapshot_report_mail.j2"
+        dest: "{{ rpt_mail_file }}"
+        mode: "0600"
+      vars:
+        rpt_mail_file: "/tmp/snapshot_report_{{ rpt_run_id }}.eml"
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Pipe the report into the local sendmail
+      ansible.builtin.shell:
+        cmd: "{{ mailcfg.sendmail }} -t < /tmp/snapshot_report_{{ rpt_run_id }}.eml"
+      register: _mail_sendmail
+      changed_when: _mail_sendmail.rc == 0
+      ignore_errors: true
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Remove the rendered message file
+      ansible.builtin.file:
+        path: "/tmp/snapshot_report_{{ rpt_run_id }}.eml"
+        state: absent
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Normalise the delivery result
+      ansible.builtin.set_fact:
+        _mail_result: >-
+          {{ _mail_smtp if mailcfg.method == 'smtp' else _mail_sendmail }}
 
     # A failed send must not be silent — the whole point is the report.
     - name: Warn if the report email could not be sent
@@ -487,8 +540,11 @@
           - " THE REPORT EMAIL WAS NOT SENT."
           - " {{ _mail_result.msg | default('unknown error') }}"
           - " Deletions above are unaffected — only the email failed."
-          - " Check smtp_host/smtp_port/smtp_secure and that the relay"
-          - " accepts mail from {{ mailcfg.from }}."
+          - " Delivery method: {{ mailcfg.method }}"
+          - " If method=smtp, check smtp_host/smtp_port/smtp_secure and that"
+          - " the relay accepts mail from {{ mailcfg.from }}."
+          - " If mail already works on this box from the command line, try:"
+          - "   -e 'email_method=sendmail'"
           - "*******************************************************"
       when:
         - mailcfg.report | bool
