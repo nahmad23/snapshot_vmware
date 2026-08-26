@@ -1,0 +1,8 @@
+From: {{ mailcfg.from }}
+To: {{ mailcfg.to | join(', ') }}
+Subject: {{ '[DRY RUN] ' if snap_dry_run | bool else '' }}{{ mailcfg.subject }}
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+{% include 'snapshot_report.html.j2' %}

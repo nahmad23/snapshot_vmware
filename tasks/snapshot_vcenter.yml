@@ -13,6 +13,7 @@
   ansible.builtin.set_fact:
     _vc: "{{ vcenter_creds[current_vc_host] }}"
     _vms: "{{ vms_by_vcenter[current_vc_host] }}"
+    _failed_details: []
 
 - name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
   ansible.builtin.debug:
@@ -55,6 +56,25 @@
   ignore_errors: true
   when: _vms | length > 0
 
+# Keep the reason each VM failed, not just its name — otherwise the only copy
+# of the vCenter error is buried in the async_status task output above.
+- name: "Collect failure reasons for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _failed_details: >-
+      {{ _failed_details | default([]) + [{
+           'vm_name': _r.item.item.vm_name,
+           'msg': (_r.msg | default('(no message returned)')) | string | trim
+         }] }}
+  loop: >-
+    {{ _job_results.results
+       | default([])
+       | selectattr('failed', 'defined')
+       | selectattr('failed', 'equalto', true)
+       | list }}
+  loop_control:
+    loop_var: _r
+    label: "{{ _r.item.item.vm_name }}"
+
 - name: "Append {{ current_vc_host }} results to snapshot_results"
   ansible.builtin.set_fact:
     snapshot_results: >-
@@ -63,14 +83,11 @@
            'total':     _vms | length,
            'succeeded': _job_results.results
                         | default([])
+                        | selectattr('failed', 'defined')
                         | selectattr('failed', 'equalto', false)
                         | map(attribute='item.item.vm_name')
                         | list,
-           'failed':    _job_results.results
-                        | default([])
-                        | selectattr('failed', 'equalto', true)
-                        | map(attribute='item.item.vm_name')
-                        | list
+           'failed':    _failed_details | default([])
          }] }}
 
 - name: "{{ current_vc_host }} — snapshot summary"
@@ -80,4 +97,5 @@
       - "  Total VMs : {{ _vms | length }}"
       - "  Succeeded : {{ snapshot_results[-1].succeeded | length }}"
       - "  Failed    : {{ snapshot_results[-1].failed | length }}"
-      - "  Failed VMs: {{ snapshot_results[-1].failed if snapshot_results[-1].failed else 'none' }}"
+      - "  Failed VMs: {{ snapshot_results[-1].failed | map(attribute='vm_name') | list
+                          if snapshot_results[-1].failed else 'none' }}"

@@ -18,6 +18,12 @@
     _snap_pairs: []
     _expired: []
     _unreadable: []
+    _del_failed_details: []
+    _in_scope: []
+    _critical_all: []
+    _critical_retained: []
+    _expired_critical: []
+    _expired_regular: []
 
 - name: "Skip {{ current_vc_host }} — no VMs assigned in CSV"
   ansible.builtin.debug:
@@ -98,33 +104,93 @@
 # ---------------------------------------------------------------------------
 # creation_time is an ISO-8601 UTC string, so a plain string comparison
 # against the 19-character cutoff is a correct chronological comparison.
-- name: "Select expired snapshots on {{ current_vc_host }}"
+# Split the snapshots in scope into the two retention tiers, then apply each
+# tier's own cutoff. Critical snapshots live longer but are not immortal.
+- name: "Split snapshots into retention tiers on {{ current_vc_host }}"
   ansible.builtin.set_fact:
-    _expired: >-
+    _in_scope: >-
       {{ _snap_pairs
          | selectattr('creation_time', 'defined')
          | rejectattr('creation_time', 'none')
-         | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
          | selectattr('name', 'search', snap_pattern)
          | list }}
   when: _vms | length > 0
 
-- name: "Snapshots eligible for deletion on {{ current_vc_host }}"
+- name: "Select expired snapshots on {{ current_vc_host }} (both tiers)"
+  ansible.builtin.set_fact:
+    _critical_all: >-
+      {{ _in_scope | selectattr('name', 'search', snap_critical_regex) | list }}
+    _expired_critical: >-
+      {{ _in_scope
+         | selectattr('name', 'search', snap_critical_regex)
+         | selectattr('creation_time', 'lt', snapshot_critical_cutoff_iso)
+         | list }}
+    _expired_regular: >-
+      {{ _in_scope
+         | rejectattr('name', 'search', snap_critical_regex)
+         | selectattr('creation_time', 'lt', snapshot_cutoff_iso)
+         | list }}
+  when: _vms | length > 0
+
+- name: "Combine both tiers into the deletion set for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _expired: "{{ _expired_regular + _expired_critical }}"
+    _critical_retained: >-
+      {{ _critical_all
+         | selectattr('creation_time', 'ge', snapshot_critical_cutoff_iso)
+         | list }}
+  when: _vms | length > 0
+
+- name: "Critical snapshots still within retention on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      RETAINED (critical): {{ item.vm_name }} :: '{{ item.name }}'
+      created {{ item.creation_time }} — kept until
+      {{ snap_critical_retention_days }} days old
+  loop: "{{ _critical_retained }}"
+  loop_control:
+    label: "{{ item.vm_name }} :: {{ item.name }}"
+
+# Audit trail: every snapshot found and the verdict on it. Without this an
+# "Expired found: 0" run gives no clue whether the snapshots were too new,
+# were filtered out by name, or were never there at all.
+- name: "All snapshots found on {{ current_vc_host }} — retention verdict"
   ansible.builtin.debug:
     msg: >-
       {{ item.vm_name }} :: '{{ item.name }}'
-      created {{ item.creation_time }} (older than {{ snapshot_cutoff_iso }})
-  loop: "{{ _expired }}"
+      created {{ item.creation_time | default('unknown') }} ->
+      {{ ('DELETE (CRITICAL, older than ' ~ snap_critical_retention_days ~ ' days)'
+          if item.name is search(snap_critical_regex)
+          else 'DELETE (older than ' ~ snap_retention_days ~ ' days)')
+         if item in _expired
+         else ('KEEP (name does not match ' ~ snap_pattern ~ ')'
+               if snap_pattern and not (item.name is search(snap_pattern))
+               else ('KEEP (CRITICAL, retained until ' ~ snap_critical_retention_days ~ ' days old)'
+                     if item.name is search(snap_critical_regex)
+                     else 'KEEP (newer than cutoff ' ~ snapshot_cutoff_iso ~ ')')) }}
+  loop: "{{ _snap_pairs }}"
   loop_control:
     label: "{{ item.vm_name }} :: {{ item.name }}"
+
+- name: "No snapshots at all on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      No snapshots found on any of the {{ _vms | length }} VM(s) queried on
+      {{ current_vc_host }}. If you expected some, check the vm_name and
+      datacenter values in the CSV.
+  when:
+    - _vms | length > 0
+    - _snap_pairs | length == 0
 
 - name: "Nothing to delete on {{ current_vc_host }}"
   ansible.builtin.debug:
     msg: >-
       {{ _snap_pairs | length }} snapshot(s) found on {{ current_vc_host }},
-      none older than {{ snap_retention_days }} days.
+      none eligible for deletion (see the verdict list above).
+      Retention {{ snap_retention_days }} days, cutoff {{ snapshot_cutoff_iso }}.
   when:
     - _vms | length > 0
+    - _snap_pairs | length > 0
     - _expired | length == 0
 
 # ---------------------------------------------------------------------------
@@ -175,6 +241,25 @@
     - _expired | length > 0
     - not (snap_dry_run | bool)
 
+# Keep the reason each deletion failed, not just which snapshot it was.
+- name: "Collect deletion failure reasons for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _del_failed_details: >-
+      {{ _del_failed_details | default([]) + [
+           _r.item.item | combine({
+             'msg': (_r.msg | default('(no message returned)')) | string | trim
+           })
+         ] }}
+  loop: >-
+    {{ _del_results.results
+       | default([])
+       | selectattr('failed', 'defined')
+       | selectattr('failed', 'equalto', true)
+       | list }}
+  loop_control:
+    loop_var: _r
+    label: "{{ _r.item.item.vm_name }} :: {{ _r.item.item.name }}"
+
 - name: "Append {{ current_vc_host }} results to deletion_results"
   ansible.builtin.set_fact:
     deletion_results: >-
@@ -184,18 +269,17 @@
            'unreadable': _unreadable,
            'snapshots':  _snap_pairs | length,
            'expired':    _expired,
+           'critical_all':      _critical_all,
+           'critical_retained': _critical_retained,
+           'expired_critical':  _expired_critical,
+           'expired_regular':   _expired_regular,
            'deleted':    _del_results.results
                          | default([])
                          | selectattr('failed', 'defined')
                          | selectattr('failed', 'equalto', false)
                          | map(attribute='item.item')
                          | list,
-           'failed':     _del_results.results
-                         | default([])
-                         | selectattr('failed', 'defined')
-                         | selectattr('failed', 'equalto', true)
-                         | map(attribute='item.item')
-                         | list
+           'failed':     _del_failed_details | default([])
          }] }}
 
 - name: "{{ current_vc_host }} — retention summary"
@@ -205,6 +289,7 @@
       - "  VMs scanned       : {{ _vms | length }}"
       - "  Unreadable VMs    : {{ _unreadable | length }}{{ ' -> ' ~ _unreadable | join(', ') if _unreadable else '' }}"
       - "  Snapshots found   : {{ _snap_pairs | length }}"
-      - "  Expired snapshots : {{ _expired | length }}"
+      - "  Expired snapshots : {{ _expired | length }} ({{ _expired_regular | length }} regular + {{ _expired_critical | length }} critical)"
+      - "  Critical retained : {{ _critical_retained | length }} of {{ _critical_all | length }}"
       - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run)' if snap_dry_run | bool else '' }}"
       - "  Failed            : {{ deletion_results[-1].failed | length }}"

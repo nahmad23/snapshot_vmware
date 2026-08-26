@@ -9,11 +9,18 @@
 #   * vCenter hostnames are taken directly from the CSV `vcenter` column.
 #   * Every snapshot older than `snapshot_retention_days` (default 10) is removed.
 #
+# Policy — two retention tiers based on the snapshot NAME:
+#   * Snapshots whose name contains "critical" (case-insensitive, anywhere in
+#     the name) are kept for `snapshot_critical_retention_days` (30) and
+#     deleted only after that.
+#   * Every other snapshot is kept for `snapshot_retention_days` (10).
+#
 # Safety:
-#   * Only snapshots whose NAME matches `snapshot_name_pattern`
-#     (default: "-security-update$") are considered, so unrelated snapshots
-#     taken by other teams/tools are never touched.
 #   * Run with -e "delete_dry_run=true" first to see exactly what would go.
+#   * Set snapshot_name_pattern="-security-update$" to narrow deletion back to
+#     only the snapshots create_snapshots.yml made.
+#
+# An HTML summary is emailed at the end of the run — see the email_* vars.
 #
 # Run it with:
 #   ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass
@@ -29,20 +36,32 @@
   gather_facts: false
 
   vars:
-    # vCenter credentials resolved from Vault-backed group_vars.
-    # See group_vars/all/vars.yml and group_vars/all/vault.yml.
+    # Default vCenter credentials, resolved from Vault-backed group_vars.
+    # Per-vCenter overrides live in vcenter_credentials — see
+    # group_vars/all/vars.yml and group_vars/all/vault.yml.
     vcenter_username: "{{ vault_vcenter_username }}"
     vcenter_password: "{{ vault_vcenter_password }}"
 
-    # Delete snapshots older than this many days.
-    # Override at runtime with:  -e "snapshot_retention_days=14"
+    # Retention for ORDINARY snapshots (name does not contain the critical
+    # keyword). Override at runtime with:  -e "snapshot_retention_days=14"
     snapshot_retention_days: 10
 
+    # Retention for CRITICAL snapshots — those whose name contains
+    # snapshot_critical_pattern below. Kept longer, then deleted like any
+    # other snapshot once past this age.
+    snapshot_critical_retention_days: 30
+
     # Only snapshots whose name matches this regular expression are eligible
-    # for deletion. The default matches the names create_snapshots.yml writes
-    # (yyyymmdd-security-update) and nothing else.
-    # Set to "" to consider EVERY snapshot regardless of name (dangerous).
-    snapshot_name_pattern: "-security-update$"
+    # for deletion at all. Empty means EVERY snapshot is in scope regardless of
+    # name; the two retention tiers below then decide when each one goes.
+    # Set to "-security-update$" to limit deletion to snapshots this tooling
+    # created and leave every other snapshot alone.
+    snapshot_name_pattern: ""
+
+    # Snapshots whose name contains this get the longer critical retention.
+    # Matched case-insensitively and anywhere in the name, so "critical",
+    # "CRITICAL", "Critical" and "db-critical-pre-upgrade" all qualify.
+    snapshot_critical_pattern: "critical"
 
     # Also delete any child snapshots of an expired snapshot. Left off so a
     # newer child snapshot is never destroyed along with its expired parent —
@@ -63,8 +82,44 @@
     #   -e "csv_file=/path/to/my_inventory.csv"
     csv_file: "{{ playbook_dir }}/vm_inventory.csv"
 
+    # -----------------------------------------------------------------------
+    # Email report
+    # -----------------------------------------------------------------------
+    # Sent at the END of the run, after deletions, so it always reflects the
+    # real outcome — including failures. Set email_report=false to skip it.
+    email_report: true
+
+    email_to:
+      - "nawazish.ahmad@unitedlex.com"
+      - "ashok.makkar@unitedlex.com"
+    email_from: "vmware-snapshots@unitedlex.com"
+    email_subject: "Vmware snapshot deletion report"
+
+    # How to deliver the report:
+    #   "smtp"     - talk SMTP directly to smtp_host:smtp_port (below).
+    #   "sendmail" - pipe the message into the local sendmail binary and let
+    #                the system MTA decide how to route it. Use this when mail
+    #                already works on this box from the command line (mail /
+    #                mailx / sendmail) — it needs no host, port or sender
+    #                permission of its own.
+    email_method: "smtp"
+    sendmail_path: "/usr/sbin/sendmail"
+
+    # SMTP relay. Only used when email_method is "smtp".
+    # The defaults assume a local MTA listening on 127.0.0.1:25,
+    # which is the usual setup on an Ansible controller. If your relay needs
+    # authentication, put the credentials in the vault as
+    # vault_smtp_username / vault_smtp_password.
+    smtp_host: "localhost"
+    smtp_port: 25
+    # "never" = plain SMTP, "starttls" = upgrade on port 587,
+    # "always" = implicit TLS on port 465, "try" = starttls if offered.
+    smtp_secure: "never"
+    smtp_username: "{{ vault_smtp_username | default('') }}"
+    smtp_password: "{{ vault_smtp_password | default('') }}"
+
   tasks:
-    - name: Ensure vCenter credentials are available from Vault
+    - name: Ensure default vCenter credentials are available from Vault
       ansible.builtin.assert:
         that:
           - vcenter_username is defined
@@ -72,19 +127,35 @@
           - vcenter_password is defined
           - vcenter_password | length > 0
         fail_msg: >-
-          vCenter credentials were not found. Define vault_vcenter_username and
-          vault_vcenter_password in group_vars/all/vault.yml (Ansible Vault) and
-          run the playbook with --ask-vault-pass or --vault-password-file.
+          Default vCenter credentials were not found. Define
+          vault_vcenter_username and vault_vcenter_password in
+          group_vars/all/vault.yml (Ansible Vault) and run the playbook with
+          --ask-vault-pass or --vault-password-file.
         quiet: true
 
     - name: Validate retention period
       ansible.builtin.assert:
         that:
-          - snapshot_retention_days | int >= 1
+          - snapshot_retention_days | int >= 0
         fail_msg: >-
-          snapshot_retention_days must be a positive whole number of days
+          snapshot_retention_days must be a whole number of days, 0 or more
           (got '{{ snapshot_retention_days }}').
         quiet: true
+
+    # 0 means "cutoff = now", i.e. delete every matching snapshot no matter how
+    # recent. Useful for cleaning up test snapshots the same day they were
+    # taken, but it removes today's snapshots too — so say so loudly.
+    - name: Warn when retention is 0 (age check disabled)
+      ansible.builtin.debug:
+        msg:
+          - "*******************************************************"
+          - " snapshot_retention_days=0 — THE AGE CHECK IS DISABLED."
+          - " EVERY snapshot in scope will be deleted, including ones"
+          - " created today."
+          - " Name filter : '{{ snapshot_name_pattern | default('', true) or '(none — ALL snapshots)' }}'"
+          - " Critical keyword: '{{ snapshot_critical_pattern }}' (also age-checked)"
+          - "*******************************************************"
+      when: snapshot_retention_days | int == 0
 
     - name: Verify PyVmomi is installed for the active Python interpreter
       ansible.builtin.command:
@@ -132,18 +203,32 @@
         'datacenter' not in vm_csv_raw.list[0] or
         'vcenter' not in vm_csv_raw.list[0]
 
-    - name: Drop blank/incomplete CSV rows
+    # The `vcenter` column is also the key used to look up per-vCenter
+    # credentials, so it is normalised to a bare lowercase hostname first:
+    # "https://pcc-1-2-3-4.ovh.de/ui" -> "pcc-1-2-3-4.ovh.de". This means a
+    # URL pasted into the CSV still matches its vcenter_credentials entry.
+    - name: Normalise the vcenter column and drop blank rows
       ansible.builtin.set_fact:
         vm_list: >-
-          {{ vm_csv_raw.list
-             | rejectattr('vm_name', 'equalto', '')
-             | rejectattr('vcenter', 'equalto', '')
-             | list }}
+          {{ vm_list | default([]) + [
+               item | combine({
+                 'vcenter': item.vcenter
+                            | regex_replace('^\s*[A-Za-z][A-Za-z0-9+.-]*:/*', '')
+                            | regex_replace('/.*$', '')
+                            | trim | lower
+               })
+             ] }}
+      loop: "{{ vm_csv_raw.list }}"
+      loop_control:
+        label: "{{ item.vm_name | default('(blank)') }}"
+      when:
+        - item.vm_name is truthy
+        - item.vcenter is truthy
 
     - name: Abort if the CSV has no usable rows
       ansible.builtin.fail:
         msg: "CSV file '{{ csv_file }}' contains no VM rows."
-      when: vm_list | length == 0
+      when: vm_list | default([]) | length == 0
 
     # -----------------------------------------------------------------------
     # Retention cutoff.
@@ -155,10 +240,12 @@
     - name: Compute the retention cutoff timestamp
       ansible.builtin.set_fact:
         snapshot_cutoff_epoch: "{{ (now(utc=true).timestamp() | int) - (snapshot_retention_days | int * 86400) }}"
+        snapshot_critical_cutoff_epoch: "{{ (now(utc=true).timestamp() | int) - (snapshot_critical_retention_days | int * 86400) }}"
 
     - name: Render the cutoff as an ISO-8601 UTC string
       ansible.builtin.set_fact:
         snapshot_cutoff_iso: "{{ '%Y-%m-%dT%H:%M:%S' | strftime(snapshot_cutoff_epoch, utc=true) }}"
+        snapshot_critical_cutoff_iso: "{{ '%Y-%m-%dT%H:%M:%S' | strftime(snapshot_critical_cutoff_epoch, utc=true) }}"
 
     - name: Extract unique vCenter hostnames from CSV
       ansible.builtin.set_fact:
@@ -170,16 +257,44 @@
           - "Detected {{ vcenter_hosts | length }} vCenter(s) in CSV:"
           - "{{ vcenter_hosts }}"
 
-    - name: Build vCenter credentials map (shared Vault credentials for all vCenters)
+    # Each vCenter uses its own entry from vcenter_credentials if one exists,
+    # otherwise it falls back to the shared vcenter_username/vcenter_password.
+    - name: Build vCenter credentials map (per-vCenter, with shared fallback)
       ansible.builtin.set_fact:
         vcenter_creds: >-
           {{ vcenter_creds | default({}) | combine({
                item: {
                  'host': item,
-                 'user': vcenter_username,
-                 'password': vcenter_password
+                 'user': (vcenter_credentials | default({})).get(item, {}).get('username', vcenter_username),
+                 'password': (vcenter_credentials | default({})).get(item, {}).get('password', vcenter_password)
                }
              }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+
+    - name: Show which credential set each vCenter will use
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }} -> {{ 'dedicated credentials (vcenter_credentials)'
+                           if item in (vcenter_credentials | default({}))
+                           else 'shared default credentials' }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Ensure every vCenter resolved to a usable username and password
+      ansible.builtin.assert:
+        that:
+          - vcenter_creds[item].user | default('', true) | length > 0
+          - vcenter_creds[item].password | default('', true) | length > 0
+        fail_msg: >-
+          No usable credentials for vCenter '{{ item }}'. Either add an entry
+          for it under vcenter_credentials in group_vars/all/vars.yml pointing
+          at vault variables, or make sure the shared vault_vcenter_username /
+          vault_vcenter_password are set in group_vars/all/vault.yml.
+        quiet: true
       loop: "{{ vcenter_hosts }}"
       loop_control:
         label: "{{ item }}"
@@ -193,8 +308,39 @@
              }) }}
       loop: "{{ vcenter_hosts }}"
 
+    # Build the critical-match regex once. The (?i) inline flag makes the match
+    # case-insensitive. An empty pattern becomes (?!) — a negative lookahead
+    # that can never match — so "no critical keyword" cannot accidentally turn
+    # into "everything is critical".
+    - name: Build the case-insensitive critical-keyword pattern
+      ansible.builtin.set_fact:
+        snap_critical_regex: >-
+          {{ '(?i)' ~ snapshot_critical_pattern
+             if snapshot_critical_pattern | default('', true) | length > 0
+             else '(?!)' }}
+
+    # These live in the play's vars block, which does not carry into the later
+    # plays, so pin them into a single fact the report play can read.
+    - name: Carry email settings into the reporting play
+      ansible.builtin.set_fact:
+        mailcfg:
+          report: "{{ email_report | bool }}"
+          to: "{{ email_to }}"
+          from: "{{ email_from }}"
+          subject: "{{ email_subject }}"
+          host: "{{ smtp_host }}"
+          port: "{{ smtp_port }}"
+          secure: "{{ smtp_secure }}"
+          username: "{{ smtp_username | default('', true) }}"
+          password: "{{ smtp_password | default('', true) }}"
+          method: "{{ email_method }}"
+          sendmail: "{{ sendmail_path }}"
+      no_log: true
+
     - name: Store retention settings and initialise results list
       ansible.builtin.set_fact:
+        snap_critical_pattern: "{{ snapshot_critical_pattern }}"
+        snap_critical_retention_days: "{{ snapshot_critical_retention_days | int }}"
         snap_pattern: "{{ snapshot_name_pattern }}"
         snap_retention_days: "{{ snapshot_retention_days | int }}"
         snap_remove_children: "{{ snapshot_remove_children | bool }}"
@@ -210,7 +356,9 @@
           {{ vcenter_hosts | length }} vCenter(s).
           Retention: {{ snap_retention_days }} days —
           deleting snapshots created before {{ snapshot_cutoff_iso }} UTC.
-          Name filter: '{{ snap_pattern if snap_pattern else '(none — all snapshots)' }}'.
+          Name filter: '{{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}'.
+          Critical keyword: '{{ snap_critical_pattern if snap_critical_pattern else '(none)' }}' (case-insensitive)
+          kept {{ snap_critical_retention_days }} days, everything else {{ snap_retention_days }} days.
           {{ 'DRY RUN — nothing will be deleted.' if snap_dry_run else '' }}
           {% for vc in vcenter_hosts %}
           {{ vc }}: {{ vms_by_vcenter[vc] | length }} VMs
@@ -260,8 +408,10 @@
           - "========================================="
           - " Mode           : {{ 'DRY RUN (nothing deleted)' if snap_dry_run else 'DELETE' }}"
           - " Retention      : {{ snap_retention_days }} days"
-          - " Cutoff (UTC)   : {{ snapshot_cutoff_iso }}"
-          - " Name filter    : {{ snap_pattern if snap_pattern else '(none — all snapshots)' }}"
+          - " Cutoff regular : {{ snapshot_cutoff_iso }} ({{ snap_retention_days }} days)"
+          - " Cutoff critical: {{ snapshot_critical_cutoff_iso }} ({{ snap_critical_retention_days }} days)"
+          - " Name filter    : {{ snap_pattern if snap_pattern else '(none — ALL snapshots in scope)' }}"
+          - " Critical match : names containing '{{ snap_critical_pattern }}' (any case)"
           - " CSV inventory  : {{ vm_list | length }} VMs total"
           - " vCenters       : {{ vcenter_hosts | length }}"
           - "-----------------------------------------"
@@ -273,7 +423,9 @@
 
     - name: List all failed deletions across all vCenters
       ansible.builtin.debug:
-        msg: "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }} :: {{ item.1.name }}"
+        msg:
+          - "FAILED on {{ item.0.vcenter }}: {{ item.1.vm_name }} :: {{ item.1.name }}"
+          - "  reason: {{ item.1.msg | default('(no message returned)') }}"
       loop: >-
         {{ deletion_results
            | selectattr('failed', 'ne', [])
@@ -292,6 +444,121 @@
       loop_control:
         label: "{{ item.1 }}"
       when: deletion_results | map(attribute='unreadable') | map('length') | sum > 0
+
+    # -----------------------------------------------------------------------
+    # Email report
+    # -----------------------------------------------------------------------
+    # Flatten the per-vCenter results into report-ready lists. Each entry keeps
+    # the vCenter it came from so the email can show it.
+    - name: Build flat report lists
+      ansible.builtin.set_fact:
+        rpt_deleted: >-
+          {{ rpt_deleted | default([]) +
+             (item.deleted | map('combine', {'vcenter': item.vcenter}) | list) }}
+        rpt_failed: >-
+          {{ rpt_failed | default([]) +
+             (item.failed | map('combine', {'vcenter': item.vcenter}) | list) }}
+        rpt_critical_retained: >-
+          {{ rpt_critical_retained | default([]) +
+             (item.critical_retained | map('combine', {'vcenter': item.vcenter}) | list) }}
+      loop: "{{ deletion_results }}"
+      loop_control:
+        label: "{{ item.vcenter }}"
+
+    - name: Compute report totals
+      ansible.builtin.set_fact:
+        rpt_deleted_critical: >-
+          {{ rpt_deleted | default([]) | selectattr('name', 'search', snap_critical_regex) | list }}
+        rpt_deleted_regular: >-
+          {{ rpt_deleted | default([]) | rejectattr('name', 'search', snap_critical_regex) | list }}
+        rpt_vms: >-
+          {{ rpt_deleted | default([]) | map(attribute='vm_name') | unique | list | sort }}
+        rpt_generated: "{{ now(utc=true, fmt='%Y-%m-%d %H:%M:%S') }} UTC"
+        rpt_run_id: "{{ now(utc=true, fmt='%Y%m%d%H%M%S') }}"
+
+    - name: Send the snapshot deletion report by email
+      community.general.mail:
+        host: "{{ mailcfg.host }}"
+        port: "{{ mailcfg.port }}"
+        username: "{{ mailcfg.username | ternary(mailcfg.username, omit) }}"
+        password: "{{ mailcfg.password | ternary(mailcfg.password, omit) }}"
+        secure: "{{ mailcfg.secure }}"
+        from: "{{ mailcfg.from }}"
+        to: "{{ mailcfg.to }}"
+        subject: >-
+          {{ '[DRY RUN] ' if snap_dry_run | bool else '' }}{{ mailcfg.subject }}
+        subtype: html
+        body: "{{ lookup('template', playbook_dir ~ '/templates/snapshot_report.html.j2') }}"
+      register: _mail_smtp
+      ignore_errors: true
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'smtp'
+
+    # ---- sendmail delivery -------------------------------------------------
+    # Renders the full RFC822 message (headers + HTML body) and pipes it into
+    # the local MTA with -t, which reads the recipients from the To: header.
+    - name: Render the report message for sendmail
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/snapshot_report_mail.j2"
+        dest: "{{ rpt_mail_file }}"
+        mode: "0600"
+      vars:
+        rpt_mail_file: "/tmp/snapshot_report_{{ rpt_run_id }}.eml"
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Pipe the report into the local sendmail
+      ansible.builtin.shell:
+        cmd: "{{ mailcfg.sendmail }} -t < /tmp/snapshot_report_{{ rpt_run_id }}.eml"
+      register: _mail_sendmail
+      changed_when: _mail_sendmail.rc == 0
+      ignore_errors: true
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Remove the rendered message file
+      ansible.builtin.file:
+        path: "/tmp/snapshot_report_{{ rpt_run_id }}.eml"
+        state: absent
+      when:
+        - mailcfg.report | bool
+        - mailcfg.method == 'sendmail'
+
+    - name: Normalise the delivery result
+      ansible.builtin.set_fact:
+        _mail_result: >-
+          {{ _mail_smtp if mailcfg.method == 'smtp' else _mail_sendmail }}
+
+    # A failed send must not be silent — the whole point is the report.
+    - name: Warn if the report email could not be sent
+      ansible.builtin.debug:
+        msg:
+          - "*******************************************************"
+          - " THE REPORT EMAIL WAS NOT SENT."
+          - " {{ _mail_result.msg | default('unknown error') }}"
+          - " Deletions above are unaffected — only the email failed."
+          - " Delivery method: {{ mailcfg.method }}"
+          - " If method=smtp, check smtp_host/smtp_port/smtp_secure and that"
+          - " the relay accepts mail from {{ mailcfg.from }}."
+          - " 'No Authentication on the server' means the relay wants NO"
+          - " credentials — remove vault_smtp_username / vault_smtp_password"
+          - " from the vault, or run with -e 'smtp_username=' -e 'smtp_password='."
+          - " If mail already works on this box from the command line, try:"
+          - "   -e 'email_method=sendmail'"
+          - "*******************************************************"
+      when:
+        - mailcfg.report | bool
+        - _mail_result.failed | default(false)
+
+    - name: Confirm the report email was sent
+      ansible.builtin.debug:
+        msg: "Report emailed to: {{ mailcfg.to | join(', ') }}"
+      when:
+        - mailcfg.report | bool
+        - not (_mail_result.failed | default(false))
 
     - name: Fail playbook if any deletion failed
       ansible.builtin.fail:
