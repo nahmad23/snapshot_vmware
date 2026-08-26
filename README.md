@@ -357,6 +357,12 @@ ansible-playbook -i inventory.ini delete_snapshots.yml --ask-vault-pass \
 If the relay needs authentication, put `vault_smtp_username` and
 `vault_smtp_password` in the encrypted vault; they are picked up automatically.
 
+> **Only add them if the relay actually requires authentication.** A local MTA
+> on `localhost:25` usually offers no `AUTH` at all, and sending credentials to
+> it fails with `No Authentication on the server at localhost:25`. To fix that,
+> remove those two variables from the vault, or blank them for one run with
+> `-e "smtp_username=" -e "smtp_password="`.
+
 Skip the email for a one-off run with `-e "email_report=false"`.
 
 ## Options
